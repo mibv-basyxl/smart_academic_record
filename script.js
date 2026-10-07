@@ -1,0 +1,4354 @@
+/* ==========================================================================
+   AcademicIQ — Smart Academic Performance Analytics Dashboard for Universities
+   Application script
+   --------------------------------------------------------------------------
+   Target environment: HTML5 + CSS3 + vanilla JavaScript ES6+ (transpiled down
+   to ES5-compatible syntax so the file runs without a build step). No
+   frameworks, no third-party libraries, no bundler. All charts are native SVG
+   generated as strings and injected into the DOM.
+
+   DEPENDENCIES
+     The host page must contain:
+       <div id="app"></div>            application mount point
+       <div id="toasts"></div>         toast container (aria-live="polite")
+       <div id="modal-root"></div>     modal mount point
+       <html data-theme="light|dark">  theme attribute on the root element
+     and must load this file with defer, or place it at the end of <body>.
+
+   SECURITY NOTE (demonstration build only)
+     Credentials are held in LocalStorage/SessionStorage and compared in the
+     browser, and authorisation is enforced only in the browser. That is
+     acceptable ONLY for the synthetic demonstration dataset. Production must
+     use a server-side identity provider with salted adaptive password hashing,
+     TLS, secure httpOnly cookies or short-lived tokens, rate limiting,
+     server-side authorisation on every request, and an append-only audit
+     store. Every function in the Service object below is the single
+     replacement point for a production REST endpoint; the UI never touches
+     storage directly.
+
+   FILE MAP
+      1.  Utilities
+      2.  Storage layer
+      3.  Reference constants
+      4.  Demo data generation
+      5.  UI primitives (toasts, modals, badges, states)
+      6.  SVG chart renderer
+      7.  Mock API / service layer
+      8.  Authentication
+      9.  Application state
+     10.  Page builders
+     11.  Router and shell
+     12.  Global search
+     13.  Event delegation
+     14.  Bootstrap
+   ========================================================================== */
+
+(function () {
+  'use strict';
+
+  /* ======================================================================
+     1. UTILITIES
+     ====================================================================== */
+  function $(sel, root) { return (root || document).querySelector(sel); }
+  function $$(sel, root) { return Array.prototype.slice.call((root || document).querySelectorAll(sel)); }
+
+  function esc(v) {
+    return String(v === null || v === undefined ? '' : v).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+  function uid(prefix) { return (prefix || 'ID') + '-' + Math.random().toString(36).slice(2, 8).toUpperCase(); }
+  function round(n, d) { var f = Math.pow(10, d === undefined ? 2 : d); return Math.round(n * f) / f; }
+  function clamp(n, a, b) { return Math.max(a, Math.min(b, n)); }
+  function sum(a) { return a.reduce(function (x, y) { return x + y; }, 0); }
+  function mean(a) { return a.length ? sum(a) / a.length : 0; }
+  function median(a) {
+    if (!a.length) { return 0; }
+    var s = a.slice().sort(function (x, y) { return x - y; });
+    var m = Math.floor(s.length / 2);
+    return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+  }
+  function num(n, d) {
+    if (n === null || n === undefined || isNaN(n)) { return '—'; }
+    return Number(n).toLocaleString('en-US', { minimumFractionDigits: d || 0, maximumFractionDigits: d || 0 });
+  }
+  function fmtDate(iso) {
+    if (!iso) { return '—'; }
+    var d = new Date(iso);
+    if (isNaN(d.getTime())) { return '—'; }
+    return d.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' });
+  }
+  function fmtDateTime(iso) {
+    if (!iso) { return '—'; }
+    var d = new Date(iso);
+    if (isNaN(d.getTime())) { return '—'; }
+    return d.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }) + ' ' +
+      d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
+  }
+  function debounce(fn, ms) {
+    var t;
+    return function () {
+      var args = arguments, self = this;
+      clearTimeout(t);
+      t = setTimeout(function () { fn.apply(self, args); }, ms);
+    };
+  }
+  function slug(s) { return String(s).toLowerCase().replace(/[^a-z0-9]+/g, '.').replace(/^\.+|\.+$/g, ''); }
+  function pct(n, d) { return d ? round((n / d) * 100, 1) : 0; }
+  function byId(list, id) {
+    for (var i = 0; i < list.length; i++) { if (list[i].id === id) { return list[i]; } }
+    return null;
+  }
+  function groupBy(list, keyFn) {
+    var out = {};
+    list.forEach(function (item) {
+      var k = keyFn(item);
+      if (!out[k]) { out[k] = []; }
+      out[k].push(item);
+    });
+    return out;
+  }
+  function initials(name) {
+    return String(name || '?').split(/\s+/).slice(0, 2).map(function (w) { return w.charAt(0).toUpperCase(); }).join('');
+  }
+  function pad(n, w) { var s = String(n); while (s.length < w) { s = '0' + s; } return s; }
+  function clone(o) {
+    if (Array.isArray(o)) { return o.map(clone); }
+    if (o && typeof o === 'object') {
+      var out = {};
+      Object.keys(o).forEach(function (k) { out[k] = clone(o[k]); });
+      return out;
+    }
+    return o;
+  }
+
+  /* Deterministic pseudo-random generator (mulberry32) — makes every demo
+     figure reproducible on every machine and every reload. */
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  /* ======================================================================
+     2. STORAGE LAYER  (centralised; swap for a REST client in production)
+     ====================================================================== */
+  var Store = (function () {
+    var ok = true;
+    try { window.localStorage.setItem('sc_probe', '1'); window.localStorage.removeItem('sc_probe'); }
+    catch (e) { ok = false; }
+    var mem = {};
+
+    function get(key, dflt) {
+      var raw = null;
+      if (ok) { try { raw = window.localStorage.getItem(key); } catch (e) { ok = false; } }
+      if (raw === null && Object.prototype.hasOwnProperty.call(mem, key)) { raw = mem[key]; }
+      if (raw === null || raw === undefined) { return dflt === undefined ? null : dflt; }
+      try { return JSON.parse(raw); } catch (e) { return dflt === undefined ? null : dflt; }
+    }
+    function set(key, val) {
+      var raw;
+      try { raw = JSON.stringify(val); } catch (e) { return false; }
+      mem[key] = raw;
+      if (ok) { try { window.localStorage.setItem(key, raw); } catch (e) { ok = false; } }
+      return true;
+    }
+    function remove(key) {
+      delete mem[key];
+      if (ok) { try { window.localStorage.removeItem(key); } catch (e) { /* ignore */ } }
+    }
+    function keys() {
+      var out = [];
+      if (ok) {
+        try {
+          for (var i = 0; i < window.localStorage.length; i++) {
+            var k = window.localStorage.key(i);
+            if (k) { out.push(k); }
+          }
+        } catch (e) { /* ignore */ }
+      }
+      Object.keys(mem).forEach(function (k) { if (out.indexOf(k) < 0) { out.push(k); } });
+      return out;
+    }
+    function reset() { keys().forEach(function (k) { if (k.indexOf('sc_') === 0) { remove(k); } }); }
+    return { get: get, set: set, remove: remove, keys: keys, reset: reset, isAvailable: function () { return ok; } };
+  })();
+
+  var Session = (function () {
+    var ok = true;
+    try { window.sessionStorage.setItem('sc_probe', '1'); window.sessionStorage.removeItem('sc_probe'); }
+    catch (e) { ok = false; }
+    var mem = {};
+    function get(key, dflt) {
+      var raw = null;
+      if (ok) { try { raw = window.sessionStorage.getItem(key); } catch (e) { ok = false; } }
+      if (raw === null && Object.prototype.hasOwnProperty.call(mem, key)) { raw = mem[key]; }
+      if (raw === null || raw === undefined) { return dflt === undefined ? null : dflt; }
+      try { return JSON.parse(raw); } catch (e) { return dflt === undefined ? null : dflt; }
+    }
+    function set(key, val) {
+      var raw = JSON.stringify(val);
+      mem[key] = raw;
+      if (ok) { try { window.sessionStorage.setItem(key, raw); } catch (e) { ok = false; } }
+      return true;
+    }
+    function remove(key) {
+      delete mem[key];
+      if (ok) { try { window.sessionStorage.removeItem(key); } catch (e) { /* ignore */ } }
+    }
+    return { get: get, set: set, remove: remove };
+  })();
+
+  /* ======================================================================
+     3. REFERENCE CONSTANTS
+     ====================================================================== */
+  var SEED = 20250915;
+  var LEVELS = [100, 200, 300, 400];
+
+  var FACULTIES = [
+    { id: 'FAC001', name: 'Faculty of Science' },
+    { id: 'FAC002', name: 'Faculty of Engineering' },
+    { id: 'FAC003', name: 'Faculty of Arts and Humanities' },
+    { id: 'FAC004', name: 'Faculty of Social Sciences' },
+    { id: 'FAC005', name: 'Faculty of Management Sciences' },
+    { id: 'FAC006', name: 'Faculty of Education' }
+  ];
+
+  var DEPARTMENTS = [
+    { id: 'DEP001', name: 'Computer Science', faculty: 'Faculty of Science' },
+    { id: 'DEP002', name: 'Mathematics', faculty: 'Faculty of Science' },
+    { id: 'DEP003', name: 'Physics', faculty: 'Faculty of Science' },
+    { id: 'DEP004', name: 'Electrical Engineering', faculty: 'Faculty of Engineering' },
+    { id: 'DEP005', name: 'Mechanical Engineering', faculty: 'Faculty of Engineering' },
+    { id: 'DEP006', name: 'English and Literature', faculty: 'Faculty of Arts and Humanities' },
+    { id: 'DEP007', name: 'Economics', faculty: 'Faculty of Social Sciences' },
+    { id: 'DEP008', name: 'Political Science', faculty: 'Faculty of Social Sciences' },
+    { id: 'DEP009', name: 'Business Administration', faculty: 'Faculty of Management Sciences' },
+    { id: 'DEP010', name: 'Educational Foundations', faculty: 'Faculty of Education' }
+  ];
+
+  var PROGRAMME_DEFS = [
+    ['B.Sc. Computer Science', 'Computer Science', 'Faculty of Science'],
+    ['B.Sc. Software Engineering', 'Computer Science', 'Faculty of Science'],
+    ['B.Sc. Mathematics', 'Mathematics', 'Faculty of Science'],
+    ['B.Sc. Statistics', 'Mathematics', 'Faculty of Science'],
+    ['B.Sc. Physics', 'Physics', 'Faculty of Science'],
+    ['B.Eng. Electrical Engineering', 'Electrical Engineering', 'Faculty of Engineering'],
+    ['B.Eng. Mechanical Engineering', 'Mechanical Engineering', 'Faculty of Engineering'],
+    ['B.A. English and Literature', 'English and Literature', 'Faculty of Arts and Humanities'],
+    ['B.Sc. Economics', 'Economics', 'Faculty of Social Sciences'],
+    ['B.Sc. Political Science', 'Political Science', 'Faculty of Social Sciences'],
+    ['B.Sc. Business Administration', 'Business Administration', 'Faculty of Management Sciences'],
+    ['B.Ed. Educational Foundations', 'Educational Foundations', 'Faculty of Education']
+  ];
+
+  /* 23 courses: three departments carry three courses, seven carry two. */
+  var COURSE_DEFS = [
+    ['CSC101', 'Introduction to Computer Science', 'Computer Science', 3, 100],
+    ['CSC201', 'Data Structures and Algorithms', 'Computer Science', 3, 200],
+    ['CSC301', 'Database Systems', 'Computer Science', 3, 300],
+    ['MTH101', 'Elementary Mathematics I', 'Mathematics', 2, 100],
+    ['MTH201', 'Linear Algebra', 'Mathematics', 3, 200],
+    ['MTH301', 'Real Analysis', 'Mathematics', 3, 300],
+    ['PHY101', 'General Physics I', 'Physics', 3, 100],
+    ['PHY201', 'Electromagnetism', 'Physics', 3, 200],
+    ['PHY301', 'Quantum Mechanics', 'Physics', 3, 300],
+    ['EEE201', 'Circuit Theory', 'Electrical Engineering', 3, 200],
+    ['EEE301', 'Control Systems', 'Electrical Engineering', 3, 300],
+    ['MEE201', 'Engineering Thermodynamics', 'Mechanical Engineering', 3, 200],
+    ['MEE301', 'Fluid Mechanics', 'Mechanical Engineering', 3, 300],
+    ['ENG101', 'Introduction to Literature', 'English and Literature', 2, 100],
+    ['ENG201', 'Advanced Composition', 'English and Literature', 3, 200],
+    ['ECO101', 'Principles of Economics', 'Economics', 2, 100],
+    ['ECO301', 'Macroeconomic Theory', 'Economics', 3, 300],
+    ['POL101', 'Introduction to Political Science', 'Political Science', 2, 100],
+    ['POL201', 'Comparative Politics', 'Political Science', 3, 200],
+    ['BUS101', 'Principles of Management', 'Business Administration', 2, 100],
+    ['BUS301', 'Financial Management', 'Business Administration', 3, 300],
+    ['EDU101', 'Foundations of Education', 'Educational Foundations', 2, 100],
+    ['EDU201', 'Educational Psychology', 'Educational Foundations', 3, 200]
+  ];
+
+  /* Four academic periods: two sessions x two semesters. */
+  var PERIOD_DEFS = [
+    ['SEM001', '2024/2025', 'First', '2024-09-16', '2025-01-24', 'Completed'],
+    ['SEM002', '2024/2025', 'Second', '2025-02-10', '2025-06-27', 'Completed'],
+    ['SEM003', '2025/2026', 'First', '2025-09-15', '2026-01-23', 'Completed'],
+    ['SEM004', '2025/2026', 'Second', '2026-02-09', '2026-06-26', 'Active']
+  ];
+
+  var DEFAULT_GRADING_SCALE = [
+    { grade: 'A', min: 70, point: 5 },
+    { grade: 'B', min: 60, point: 4 },
+    { grade: 'C', min: 50, point: 3 },
+    { grade: 'D', min: 45, point: 2 },
+    { grade: 'E', min: 40, point: 1 },
+    { grade: 'F', min: 0, point: 0 }
+  ];
+
+  /* Expected credits by level, used by the credit-completion component of the
+     MVP risk model. Illustrative values, configurable in a production build. */
+  var EXPECTED_CREDITS = { 100: 14, 200: 22, 300: 26, 400: 30 };
+
+  var FIRST = ['Amina', 'Chidi', 'Fatima', 'Tunde', 'Ngozi', 'Ibrahim', 'Zainab', 'Emeka', 'Halima', 'Segun',
+    'Yemi', 'Kelechi', 'Aisha', 'Bola', 'Musa', 'Ifeoma', 'Sadiq', 'Temi', 'Uche', 'Rukayat',
+    'Daniel', 'Grace', 'Peter', 'Maryam', 'Joseph', 'Blessing', 'Samuel', 'Hauwa', 'Victor', 'Esther'];
+  var LAST = ['Okafor', 'Adeyemi', 'Bello', 'Nwosu', 'Ibrahim', 'Ogunleye', 'Eze', 'Yusuf', 'Balogun', 'Chukwu',
+    'Sani', 'Adebayo', 'Okonkwo', 'Lawal', 'Umeh', 'Danjuma', 'Afolabi', 'Oni', 'Nwachukwu', 'Salihu'];
+
+  var ROLE_LABEL = {
+    student: 'Student',
+    lecturer: 'Lecturer',
+    department_admin: 'Department Administrator',
+    adviser: 'Academic Adviser',
+    university_admin: 'University Administrator',
+    super_admin: 'Super Administrator'
+  };
+
+  var ALL_ROLES = ['student', 'lecturer', 'department_admin', 'adviser', 'university_admin', 'super_admin'];
+
+  /* ======================================================================
+     4. DEMO DATA GENERATION (deterministic; seeded once)
+     ====================================================================== */
+  function gradeFor(score, scale) {
+    var s = scale || DEFAULT_GRADING_SCALE;
+    for (var i = 0; i < s.length; i++) { if (score >= s[i].min) { return s[i]; } }
+    return s[s.length - 1];
+  }
+
+  function seedDatabase() {
+    var rnd = mulberry32(SEED);
+    var usedNames = {};
+    function makeName(start) {
+      var i = start;
+      for (var guard = 0; guard < 4000; guard++) {
+        var n = FIRST[i % FIRST.length] + ' ' + LAST[(i * 7) % LAST.length];
+        if (!usedNames[n]) { usedNames[n] = 1; return n; }
+        i++;
+      }
+      return 'Demo Person ' + start;
+    }
+
+    var now = new Date().toISOString();
+
+    /* --- structure ------------------------------------------------------ */
+    var faculties = FACULTIES.map(function (f) { return { id: f.id, name: f.name }; });
+    var departments = DEPARTMENTS.map(function (d) { return { id: d.id, name: d.name, faculty: d.faculty, programmes: [] }; });
+    var programmes = PROGRAMME_DEFS.map(function (p, i) {
+      return { id: 'PRG' + pad(i + 1, 3), name: p[0], department: p[1], faculty: p[2] };
+    });
+    programmes.forEach(function (p) {
+      departments.forEach(function (d) { if (d.name === p.department) { d.programmes.push(p.name); } });
+    });
+    var semesters = PERIOD_DEFS.map(function (p) {
+      return { id: p[0], session: p[1], semester: p[2], startDate: p[3], endDate: p[4], status: p[5] };
+    });
+
+    /* --- users (22: 1 super admin, 1 university admin, 2 dept admins,
+           3 advisers, 5 lecturers, 10 students) -------------------------- */
+    var users = [];
+    function pushUser(o) { users.push(o); }
+
+    pushUser({ id: 'USR001', name: 'Super Administrator', email: 'superadmin@academiciq.demo', password: 'Super123!',
+      role: 'super_admin', faculty: '', department: '', programme: '', level: null, phone: '+234 800 000 0001',
+      universityId: 'STAFF/001', linkedId: '', status: 'active', lastLogin: '', createdAt: now });
+    pushUser({ id: 'USR002', name: 'University Administrator', email: 'admin@academiciq.demo', password: 'Admin123!',
+      role: 'university_admin', faculty: '', department: '', programme: '', level: null, phone: '+234 800 000 0002',
+      universityId: 'STAFF/002', linkedId: '', status: 'active', lastLogin: '', createdAt: now });
+    pushUser({ id: 'USR003', name: 'Department Administrator', email: 'deptadmin@academiciq.demo', password: 'Dept123!',
+      role: 'department_admin', faculty: 'Faculty of Science', department: 'Computer Science', programme: '', level: null,
+      phone: '+234 800 000 0003', universityId: 'STAFF/003', linkedId: '', status: 'active', lastLogin: '', createdAt: now });
+    pushUser({ id: 'USR004', name: makeName(101), email: 'deptadmin2@academiciq.demo', password: 'Dept123!',
+      role: 'department_admin', faculty: 'Faculty of Engineering', department: 'Mechanical Engineering', programme: '',
+      level: null, phone: '+234 800 000 0004', universityId: 'STAFF/004', linkedId: '', status: 'active', lastLogin: '', createdAt: now });
+    pushUser({ id: 'USR005', name: 'Academic Adviser', email: 'adviser@academiciq.demo', password: 'Adviser123!',
+      role: 'adviser', faculty: 'Faculty of Science', department: 'Computer Science', programme: '', level: null,
+      phone: '+234 800 000 0005', universityId: 'STAFF/005', linkedId: '', status: 'active', lastLogin: '', createdAt: now });
+    pushUser({ id: 'USR006', name: makeName(103), email: 'adviser2@academiciq.demo', password: 'Adviser123!',
+      role: 'adviser', faculty: 'Faculty of Social Sciences', department: 'Economics', programme: '', level: null,
+      phone: '+234 800 000 0006', universityId: 'STAFF/006', linkedId: '', status: 'active', lastLogin: '', createdAt: now });
+    pushUser({ id: 'USR007', name: makeName(104), email: 'adviser3@academiciq.demo', password: 'Adviser123!',
+      role: 'adviser', faculty: 'Faculty of Engineering', department: 'Electrical Engineering', programme: '', level: null,
+      phone: '+234 800 000 0007', universityId: 'STAFF/007', linkedId: '', status: 'active', lastLogin: '', createdAt: now });
+
+    var lecturerIds = [];
+    for (var li = 0; li < 5; li++) {
+      var lid = 'USR' + pad(8 + li, 3);
+      lecturerIds.push(lid);
+      var ldept = DEPARTMENTS[li % DEPARTMENTS.length];
+      pushUser({ id: lid, name: li === 0 ? 'Lecturer Demo' : makeName(110 + li),
+        email: li === 0 ? 'lecturer@academiciq.demo' : ('lecturer' + (li + 1) + '@academiciq.demo'),
+        password: 'Lecturer123!',
+        role: 'lecturer', faculty: ldept.faculty, department: ldept.name, programme: '', level: null,
+        phone: '+234 800 000 01' + pad(li, 2), universityId: 'STAFF/01' + pad(li, 2), linkedId: lid,
+        status: 'active', lastLogin: '', createdAt: now });
+    }
+
+    /* --- courses -------------------------------------------------------- */
+    var courses = COURSE_DEFS.map(function (c, i) {
+      return {
+        id: 'CRS' + pad(i + 1, 3), code: c[0], title: c[1], department: c[2],
+        creditUnit: c[3], level: c[4], lecturerId: lecturerIds[i % lecturerIds.length]
+      };
+    });
+
+    /* --- students (60: 6 per department, 15 per level) ------------------ */
+    var students = [];
+    for (var si = 0; si < 60; si++) {
+      var dept = DEPARTMENTS[Math.floor(si / 6)];
+      var progs = programmes.filter(function (p) { return p.department === dept.name; });
+      var prog = progs[si % progs.length];
+      var lvl = LEVELS[si % 4];
+      var nm = makeName(si);
+      students.push({
+        id: 'STU' + pad(si + 1, 3),
+        studentId: 'UNI/2023/' + pad(si + 1, 3),
+        name: nm,
+        gender: rnd() < 0.5 ? 'Female' : 'Male',
+        email: slug(nm) + '@student.academiciq.demo',
+        programme: prog.name,
+        department: dept.name,
+        faculty: dept.faculty,
+        level: lvl,
+        session: '2025/2026',
+        attendance: 0,
+        attBase: round(52 + rnd() * 46, 1),
+        ability: round(0.32 + rnd() * 0.55, 3),
+        status: (si % 19 === 0) ? 'inactive' : 'active',
+        createdAt: now
+      });
+    }
+
+    /* --- result records: exactly 528 ------------------------------------
+       195 period-slots (level 100 -> last 2 periods, level 200 -> last 3,
+       levels 300/400 -> all 4). 138 of those slots carry three courses and
+       57 carry two: 195 x 2 + 138 = 528.                                 */
+    var slots = [];
+    for (var i2 = 0; i2 < students.length; i2++) {
+      var lv = students[i2].level;
+      var nPeriods = lv === 100 ? 2 : (lv === 200 ? 3 : 4);
+      for (var p = 4 - nPeriods; p < 4; p++) { slots.push({ student: i2, period: p }); }
+    }
+
+    var candidateLists = students.map(function (st) {
+      var own = courses.filter(function (c) { return c.department === st.department; })
+        .sort(function (a, b) { return a.level - b.level; });
+      var rest = courses.filter(function (c) { return c.department !== st.department; })
+        .sort(function (a, b) { return a.code < b.code ? -1 : (a.code > b.code ? 1 : 0); });
+      return own.concat(rest);
+    });
+
+    var ptr = students.map(function () { return 0; });
+    var results = [];
+    var ridx = 0;
+
+    for (var j = 0; j < slots.length; j++) {
+      var three = Math.floor(((j + 1) * 138) / 195) - Math.floor((j * 138) / 195);
+      var courseCount = 2 + three;
+      var stIdx = slots[j].student;
+      var st = students[stIdx];
+      var period = semesters[slots[j].period];
+      var list = candidateLists[stIdx];
+
+      for (var k = 0; k < courseCount; k++) {
+        if (ptr[stIdx] >= list.length) { ptr[stIdx] = 0; }
+        var course = list[ptr[stIdx]];
+        ptr[stIdx]++;
+
+        var raw = st.ability * 100 + (rnd() - 0.5) * 36;
+        var score = clamp(Math.round(raw), 0, 100);
+        var band = gradeFor(score);
+        var att = clamp(Math.round(st.attBase + (rnd() - 0.5) * 16), 20, 100);
+        var assessment = clamp(Math.round(score * 0.4 + (rnd() - 0.5) * 12), 0, 40);
+        var exam = clamp(score - assessment, 0, 60);
+
+        ridx++;
+        results.push({
+          id: 'RES' + pad(ridx, 4),
+          studentId: st.id,
+          courseId: course.id,
+          session: period.session,
+          semester: period.semester,
+          score: score,
+          grade: band.grade,
+          gradePoint: band.point,
+          creditUnit: course.creditUnit,
+          attendance: att,
+          assessmentScore: assessment,
+          examScore: exam,
+          imported: false,
+          createdAt: now
+        });
+      }
+    }
+
+    /* overall attendance per student = mean of their course attendance */
+    students.forEach(function (s) {
+      var rs = results.filter(function (r) { return r.studentId === s.id; });
+      s.attendance = rs.length ? Math.round(mean(rs.map(function (r) { return r.attendance; }))) : 0;
+      delete s.attBase;
+    });
+
+    /* --- 10 student accounts, linked to the first 10 students ----------- */
+    for (var sa = 0; sa < 10; sa++) {
+      var linkSt = students[sa];
+      pushUser({
+        id: 'USR' + pad(13 + sa, 3),
+        name: sa === 0 ? 'Student Demo' : linkSt.name,
+        email: sa === 0 ? 'student@academiciq.demo' : linkSt.email,
+        password: 'Student123!',
+        role: 'student', faculty: linkSt.faculty, department: linkSt.department,
+        programme: linkSt.programme, level: linkSt.level, phone: '+234 800 000 02' + pad(sa, 2),
+        universityId: linkSt.studentId, linkedId: linkSt.id, status: 'active', lastLogin: '', createdAt: now
+      });
+    }
+
+    /* --- settings ------------------------------------------------------- */
+    var settings = {
+      institutionId: 'INST-001',
+      plan: 'Professional',
+      institution: {
+        name: 'Federal University of Technology',
+        logoText: 'FUT',
+        address: '1 University Road, Innovation City',
+        contact: 'registrar@fut.demo · +234 800 100 2000'
+      },
+      academic: {
+        passMark: 40,
+        attendanceThreshold: 70,
+        requiredCredits: 120,
+        gradingScale: DEFAULT_GRADING_SCALE.slice()
+      },
+      risk: { gpaThreshold: 2.5, attendanceThreshold: 70, failureThreshold: 2, decliningThreshold: 0.3 },
+      notifications: { email: true, inApp: true, sms: false }
+    };
+
+    /* --- two seeded interventions -------------------------------------- */
+    var atRiskSeed = students.slice().sort(function (a, b) {
+      return a.attendance - b.attendance;
+    }).slice(0, 2);
+    var interventions = atRiskSeed.map(function (s, i) {
+      return {
+        id: 'INT' + pad(i + 1, 3),
+        studentId: s.id,
+        riskLevel: i === 0 ? 'High' : 'Moderate',
+        issue: i === 0 ? 'Attendance below the configured threshold' : 'Cumulative GPA below the configured threshold',
+        type: i === 0 ? 'Attendance follow-up' : 'Academic advising',
+        adviser: users[4].name,
+        date: '2026-03-04',
+        action: i === 0
+          ? 'Contacted the student to review attendance barriers and agreed a weekly check-in.'
+          : 'Reviewed the study plan and referred the student to departmental tutoring.',
+        outcome: i === 0 ? 'Student resumed regular attendance.' : 'Awaiting the next assessment period.',
+        followUp: i === 0 ? '2026-04-01' : '2026-04-15',
+        status: i === 0 ? 'Completed' : 'In Progress',
+        createdAt: now
+      };
+    });
+
+    /* --- notifications and initial audit entry -------------------------- */
+    var notifications = [
+      { id: 'NTF001', type: 'System notification', title: 'Welcome to AcademicIQ',
+        body: 'The demonstration dataset has been generated. Explore the dashboards, analytics and reports.',
+        target: '#/dashboard', date: now, read: false },
+      { id: 'NTF002', type: 'Data import completed', title: 'Demo dataset loaded',
+        body: '60 students, 23 courses and 528 result records are available for analysis.',
+        target: '#/students', date: now, read: false }
+    ];
+    var auditLogs = [
+      { id: 'AUD001', action: 'System initialised', user: 'system', role: 'system',
+        target: 'sc_students', description: 'Seeded demonstration dataset: 60 students, 23 courses, 528 results.',
+        date: now }
+    ];
+
+    Store.set('sc_faculties', faculties);
+    Store.set('sc_departments', departments);
+    Store.set('sc_programmes', programmes);
+    Store.set('sc_courses', courses);
+    Store.set('sc_students', students);
+    Store.set('sc_results', results);
+    Store.set('sc_users', users);
+    Store.set('sc_semesters', semesters);
+    Store.set('sc_interventions', interventions);
+    Store.set('sc_notifications', notifications);
+    Store.set('sc_alerts', []);
+    Store.set('sc_audit_logs', auditLogs);
+    Store.set('sc_settings', settings);
+    Store.set('sc_seeded', true);
+  }
+
+  /* ======================================================================
+     5. UI PRIMITIVES  (toasts, modals, badges, states)
+     ====================================================================== */
+  var UI = {
+    toast: function (title, message, tone) {
+      var wrap = $('#toasts');
+      if (!wrap) { return; }
+      var el = document.createElement('div');
+      el.className = 'toast ' + (tone || '');
+      el.setAttribute('role', 'status');
+      el.innerHTML = '<strong>' + esc(title) + '</strong>' + (message ? esc(message) : '');
+      wrap.appendChild(el);
+      setTimeout(function () {
+        el.style.opacity = '0';
+        setTimeout(function () { if (el.parentNode) { el.parentNode.removeChild(el); } }, 250);
+      }, 4200);
+    },
+    modal: function (title, bodyHtml, onMount) {
+      var root = $('#modal-root');
+      root.innerHTML =
+        '<div class="modal-back" role="dialog" aria-modal="true" aria-label="' + esc(title) + '">' +
+          '<div class="modal">' +
+            '<h2>' + esc(title) + '</h2>' +
+            '<div class="modal-body">' + bodyHtml + '</div>' +
+          '</div>' +
+        '</div>';
+      var back = $('.modal-back', root);
+      back.addEventListener('mousedown', function (e) { if (e.target === back) { UI.closeModal(); } });
+      var focusable = $$('button, [href], input, select, textarea', back);
+      if (focusable.length) { focusable[0].focus(); }
+      if (typeof onMount === 'function') { onMount(back); }
+    },
+    closeModal: function () {
+      var root = $('#modal-root');
+      if (root) { root.innerHTML = ''; }
+    },
+    confirm: function (title, message, onYes) {
+      UI.modal(title,
+        '<p>' + esc(message) + '</p>' +
+        '<div class="modal-actions">' +
+          '<button class="btn" data-modal-cancel="1">Cancel</button>' +
+          '<button class="btn btn-danger" data-modal-confirm="1">Confirm</button>' +
+        '</div>',
+        function (scope) {
+          var c = $('[data-modal-cancel]', scope), y = $('[data-modal-confirm]', scope);
+          if (c) { c.addEventListener('click', UI.closeModal); }
+          if (y) { y.addEventListener('click', function () { UI.closeModal(); onYes(); }); }
+        });
+    },
+    riskBadge: function (band) {
+      var cls = band === 'Critical' ? 'b-crit' : band === 'High' ? 'b-high' : band === 'Moderate' ? 'b-mod' : 'b-low';
+      return '<span class="badge ' + cls + '">' + esc(band) + '</span>';
+    },
+    statusBadge: function (status) {
+      var cls = status === 'active' || status === 'Active' ? 'b-good'
+        : status === 'suspended' ? 'b-bad'
+        : status === 'Completed' ? 'b-good'
+        : status === 'In Progress' ? 'b-info'
+        : status === 'Follow-up Required' ? 'b-warn'
+        : 'b-neutral';
+      return '<span class="badge ' + cls + '">' + esc(status) + '</span>';
+    },
+    gradeBadge: function (grade) {
+      var cls = (grade === 'A' || grade === 'B') ? 'b-good' : grade === 'F' ? 'b-bad' : (grade === 'D' || grade === 'E') ? 'b-warn' : 'b-info';
+      return '<span class="badge ' + cls + '">' + esc(grade) + '</span>';
+    },
+    progress: function (value, tone) {
+      var v = clamp(value, 0, 100);
+      return '<div class="progress ' + (tone || '') + '" role="progressbar" aria-valuenow="' + round(v, 1) +
+        '" aria-valuemin="0" aria-valuemax="100"><span style="width:' + v + '%"></span></div>';
+    },
+    empty: function (message, title) {
+      return '<div class="state"><strong>' + esc(title || 'No data') + '</strong>' + esc(message) + '</div>';
+    },
+    loading: function (message) {
+      return '<div class="state"><div class="skeleton" style="width:60%;margin:0 auto 8px"></div>' +
+        '<div class="skeleton" style="width:40%;margin:0 auto 8px"></div>' + esc(message || 'Loading academic analytics…') + '</div>';
+    },
+    error: function (message) {
+      return '<div class="state bad"><strong>Unable to load the requested data</strong>' +
+        esc(message || 'An unexpected error occurred while reading the stored dataset.') + '</div>';
+    },
+    denied: function () {
+      return '<div class="state"><strong>You do not have permission to view this page</strong>' +
+        'This page is restricted to another role. Contact your administrator if you believe you should have access.</div>';
+    },
+    kpi: function (label, value, caption, tone) {
+      return '<div class="kpi ' + (tone || '') + '">' +
+        '<div class="k-label">' + esc(label) + '</div>' +
+        '<div class="k-value">' + esc(value) + '</div>' +
+        '<div class="k-cap">' + esc(caption || '') + '</div></div>';
+    },
+    table: function (headers, rows, opts) {
+      opts = opts || {};
+      if (!rows.length) { return UI.empty(opts.emptyMessage || 'No academic records match the selected filters.'); }
+      var head = '<tr>' + headers.map(function (h) {
+        var label = typeof h === 'string' ? h : h.label;
+        var align = (typeof h === 'object' && h.num) ? ' class="num"' : '';
+        return '<th' + align + ' scope="col">' + esc(label) + '</th>';
+      }).join('') + '</tr>';
+      var body = rows.map(function (r) {
+        return '<tr>' + r.map(function (c, i) {
+          var h = headers[i];
+          var align = (typeof h === 'object' && h.num) ? ' class="num"' : '';
+          return '<td' + align + '>' + (c === null || c === undefined ? '—' : c) + '</td>';
+        }).join('') + '</tr>';
+      }).join('');
+      return '<div class="table-scroll"><table class="data"><thead>' + head + '</thead><tbody>' + body + '</tbody></table></div>';
+    },
+    insights: function (list) {
+      if (!list.length) { return UI.empty('No observations were produced for the current selection.'); }
+      return list.map(function (i) {
+        return '<div class="insight ' + esc(i.tone) + '"><span class="dot"></span><span>' + esc(i.text) + '</span></div>';
+      }).join('');
+    },
+    downloadCSV: function (filename, rows) {
+      var csv = rows.map(function (r) {
+        return r.map(function (cell) {
+          var s = (cell === null || cell === undefined) ? '' : String(cell);
+          return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+        }).join(',');
+      }).join('\r\n');
+      var blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(function () { URL.revokeObjectURL(url); }, 1200);
+    }
+  };
+
+  /* ======================================================================
+     6. SVG CHART RENDERER  (native SVG only — no charting library)
+     ====================================================================== */
+  var Charts = {
+    COLORS: ['#2563eb', '#0f766e', '#b45309', '#b91c1c', '#7c3aed', '#0891b2', '#db2777', '#65a30d'],
+
+    line: function (opts) {
+      var series = opts.series || [];
+      var labels = opts.labels || [];
+      var w = 760, h = 280, pl = 46, pr = 16, pt = 16, pb = 40;
+      var iw = w - pl - pr, ih = h - pt - pb;
+      var yMax = opts.yMax || 5;
+      if (!labels.length || !series.length || !series[0].values.length) {
+        return '<div class="chart-empty">No academic records match the selected filters.</div>';
+      }
+      var parts = [];
+      parts.push('<svg class="chart" viewBox="0 0 ' + w + ' ' + h + '" role="img" aria-label="' + esc(opts.title || 'Line chart') + '" preserveAspectRatio="xMidYMid meet">');
+      for (var g = 0; g <= 5; g++) {
+        var gy = pt + ih - (g / 5) * ih;
+        parts.push('<line x1="' + pl + '" y1="' + gy + '" x2="' + (pl + iw) + '" y2="' + gy + '" stroke="currentColor" stroke-opacity="0.12" stroke-width="1"/>');
+        parts.push('<text x="' + (pl - 8) + '" y="' + (gy + 4) + '" text-anchor="end" font-size="11" fill="currentColor" fill-opacity="0.55">' +
+          round((yMax * g) / 5, 1) + '</text>');
+      }
+      labels.forEach(function (lb, i) {
+        var x = labels.length > 1 ? pl + (i * iw) / (labels.length - 1) : pl + iw / 2;
+        parts.push('<text x="' + x + '" y="' + (h - 14) + '" text-anchor="middle" font-size="11" fill="currentColor" fill-opacity="0.6">' + esc(lb) + '</text>');
+      });
+      series.forEach(function (s, si) {
+        var color = s.color || Charts.COLORS[si % Charts.COLORS.length];
+        var pts = s.values.map(function (v, i) {
+          var x = s.values.length > 1 ? pl + (i * iw) / (s.values.length - 1) : pl + iw / 2;
+          var y = pt + ih - (clamp(v, 0, yMax) / yMax) * ih;
+          return { x: x, y: y, v: v };
+        });
+        parts.push('<polyline fill="none" stroke="' + color + '" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round" points="' +
+          pts.map(function (p) { return p.x + ',' + p.y; }).join(' ') + '"/>');
+        pts.forEach(function (p) {
+          parts.push('<circle cx="' + p.x + '" cy="' + p.y + '" r="4" fill="' + color + '"><title>' +
+            esc(s.name + ': ' + p.v) + '</title></circle>');
+        });
+      });
+      parts.push('</svg>');
+      var legend = '<div class="legend">' + series.map(function (s, si) {
+        return '<span><i style="background:' + (s.color || Charts.COLORS[si % Charts.COLORS.length]) + '"></i>' + esc(s.name) + '</span>';
+      }).join('') + '</div>';
+      return parts.join('') + legend;
+    },
+
+    bar: function (opts) {
+      var labels = opts.labels || [];
+      var values = opts.values || [];
+      var w = 760, h = 280, pl = 46, pr = 16, pt = 16, pb = 58;
+      var iw = w - pl - pr, ih = h - pt - pb;
+      var yMax = opts.yMax || 100;
+      if (!labels.length) { return '<div class="chart-empty">No academic records match the selected filters.</div>'; }
+      var n = labels.length;
+      var step = iw / n;
+      var bw = Math.max(8, Math.min(58, step * 0.6));
+      var parts = [];
+      parts.push('<svg class="chart" viewBox="0 0 ' + w + ' ' + h + '" role="img" aria-label="' + esc(opts.title || 'Bar chart') + '" preserveAspectRatio="xMidYMid meet">');
+      for (var g = 0; g <= 5; g++) {
+        var gy = pt + ih - (g / 5) * ih;
+        parts.push('<line x1="' + pl + '" y1="' + gy + '" x2="' + (pl + iw) + '" y2="' + gy + '" stroke="currentColor" stroke-opacity="0.12"/>');
+        parts.push('<text x="' + (pl - 8) + '" y="' + (gy + 4) + '" text-anchor="end" font-size="11" fill="currentColor" fill-opacity="0.55">' +
+          round((yMax * g) / 5, 0) + '</text>');
+      }
+      labels.forEach(function (lb, i) {
+        var x = pl + step * i + step / 2;
+        var v = clamp(values[i] || 0, 0, yMax);
+        var bh = (v / yMax) * ih;
+        var y = pt + ih - bh;
+        var color = opts.colors && opts.colors[i] ? opts.colors[i] : Charts.COLORS[i % Charts.COLORS.length];
+        parts.push('<rect x="' + (x - bw / 2) + '" y="' + y + '" width="' + bw + '" height="' + Math.max(bh, 1) +
+          '" rx="3" fill="' + color + '"><title>' + esc(lb + ': ' + (values[i] === null ? 'n/a' : round(values[i], 1))) + '</title></rect>');
+        parts.push('<text x="' + x + '" y="' + (h - 40) + '" text-anchor="middle" font-size="10" fill="currentColor" fill-opacity="0.65">' +
+          esc(String(lb).slice(0, 12)) + '</text>');
+      });
+      parts.push('</svg>');
+      return parts.join('');
+    },
+
+    donut: function (opts) {
+      var segments = (opts.segments || []).filter(function (s) { return s.value > 0; });
+      if (!segments.length) { return '<div class="chart-empty">No academic records match the selected filters.</div>'; }
+      var total = sum(segments.map(function (s) { return s.value; }));
+      var size = 240, r = 88, cx = size / 2, cy = size / 2, circ = 2 * Math.PI * r;
+      var offset = 0;
+      var parts = [];
+      parts.push('<svg class="chart" viewBox="0 0 ' + size + ' ' + size + '" role="img" aria-label="' + esc(opts.title || 'Donut chart') + '" style="max-width:240px;margin:0 auto">');
+      parts.push('<circle cx="' + cx + '" cy="' + cy + '" r="' + r + '" fill="none" stroke="currentColor" stroke-opacity="0.1" stroke-width="26"/>');
+      segments.forEach(function (s, i) {
+        var frac = s.value / total;
+        var len = frac * circ;
+        var color = s.color || Charts.COLORS[i % Charts.COLORS.length];
+        parts.push('<circle cx="' + cx + '" cy="' + cy + '" r="' + r + '" fill="none" stroke="' + color +
+          '" stroke-width="26" stroke-dasharray="' + round(len, 2) + ' ' + round(circ - len, 2) +
+          '" stroke-dashoffset="' + round(-offset, 2) + '" transform="rotate(-90 ' + cx + ' ' + cy + ')"><title>' +
+          esc(s.label + ': ' + s.value + ' (' + round(frac * 100, 1) + '%)') + '</title></circle>');
+        offset += len;
+      });
+      parts.push('<text x="' + cx + '" y="' + (cy - 2) + '" text-anchor="middle" font-size="26" font-weight="700" fill="currentColor">' + total + '</text>');
+      parts.push('<text x="' + cx + '" y="' + (cy + 18) + '" text-anchor="middle" font-size="11" fill="currentColor" fill-opacity="0.6">' + esc(opts.unit || 'records') + '</text>');
+      parts.push('</svg>');
+      var legend = '<div class="legend" style="justify-content:center">' + segments.map(function (s, i) {
+        return '<span><i style="background:' + (s.color || Charts.COLORS[i % Charts.COLORS.length]) + '"></i>' +
+          esc(s.label) + ' · ' + s.value + ' (' + round((s.value / total) * 100, 1) + '%)</span>';
+      }).join('') + '</div>';
+      return parts.join('') + legend;
+    },
+
+    progressList: function (rows, opts) {
+      opts = opts || {};
+      if (!rows.length) { return '<div class="chart-empty">No academic records match the selected filters.</div>'; }
+      var max = opts.max || 100;
+      return rows.map(function (r) {
+        var v = clamp(r.value, 0, max);
+        var w = (v / max) * 100;
+        var tone = opts.toneFn ? opts.toneFn(r.value) : '';
+        return '<div class="progress-row"><span class="p-label">' + esc(r.label) + '</span>' +
+          '<div class="progress ' + tone + '" role="progressbar" aria-valuenow="' + round(v, 1) +
+          '" aria-valuemin="0" aria-valuemax="' + max + '"><span style="width:' + w + '%"></span></div>' +
+          '<span class="p-val">' + (r.display !== undefined ? esc(r.display) : round(v, 1)) + '</span></div>';
+      }).join('');
+    }
+  };
+
+  /* ======================================================================
+     7. MOCK API / SERVICE LAYER
+     Every function below is the single replacement point for a production
+     REST endpoint. The UI never touches storage directly.
+     ====================================================================== */
+  var Service = {
+    faculties: function () { return Store.get('sc_faculties', []); },
+    departments: function () { return Store.get('sc_departments', []); },
+    programmes: function () { return Store.get('sc_programmes', []); },
+    courses: function () { return Store.get('sc_courses', []); },
+    students: function () { return Store.get('sc_students', []); },
+    results: function () { return Store.get('sc_results', []); },
+    users: function () { return Store.get('sc_users', []); },
+    semesters: function () { return Store.get('sc_semesters', []); },
+    interventions: function () { return Store.get('sc_interventions', []); },
+    notifications: function () { return Store.get('sc_notifications', []); },
+    alerts: function () { return Store.get('sc_alerts', []); },
+    auditLogs: function () { return Store.get('sc_audit_logs', []); },
+    settings: function () { return Store.get('sc_settings', null); },
+
+    saveSettings: function (s) {
+      Store.set('sc_settings', s);
+      Service.audit('Settings changed', 'sc_settings', 'Institutional settings updated');
+    },
+    saveStudents: function (list) { Store.set('sc_students', list); },
+    saveResults: function (list) { Store.set('sc_results', list); },
+    saveCourses: function (list) { Store.set('sc_courses', list); },
+    saveUsers: function (list) { Store.set('sc_users', list); },
+    saveInterventions: function (list) { Store.set('sc_interventions', list); },
+    saveNotifications: function (list) { Store.set('sc_notifications', list); },
+    saveAlerts: function (list) { Store.set('sc_alerts', list); },
+    saveSemesters: function (list) { Store.set('sc_semesters', list); },
+    saveFaculties: function (list) { Store.set('sc_faculties', list); },
+    saveDepartments: function (list) { Store.set('sc_departments', list); },
+
+    audit: function (action, target, description) {
+      var logs = Service.auditLogs();
+      var u = Auth.current();
+      logs.unshift({
+        id: uid('AUD'),
+        action: action,
+        user: u ? u.email : 'system',
+        role: u ? u.role : 'system',
+        target: target || '',
+        description: description || '',
+        date: new Date().toISOString()
+      });
+      if (logs.length > 300) { logs = logs.slice(0, 300); }
+      Store.set('sc_audit_logs', logs);
+    },
+
+    /* ---- lookups ------------------------------------------------------ */
+    student: function (id) { return byId(Service.students(), id); },
+    course: function (id) { return byId(Service.courses(), id); },
+    courseByCode: function (code) {
+      var c = Service.courses().filter(function (x) { return x.code.toUpperCase() === String(code).toUpperCase(); });
+      return c.length ? c[0] : null;
+    },
+    resultsFor: function (studentId) {
+      return Service.results().filter(function (r) { return r.studentId === studentId; });
+    },
+    resultsForCourse: function (courseId) {
+      return Service.results().filter(function (r) { return r.courseId === courseId; });
+    },
+    lecturerOf: function (course) {
+      if (!course) { return null; }
+      return byId(Service.users(), course.lecturerId);
+    },
+
+    /* ---- role-scoped visibility --------------------------------------- */
+    visibleStudents: function (user) {
+      var all = Service.students();
+      if (!user) { return []; }
+      if (user.role === 'student') {
+        return all.filter(function (s) { return s.id === user.linkedId; });
+      }
+      if (user.role === 'lecturer') {
+        var mine = Service.courses().filter(function (c) { return c.lecturerId === user.id; });
+        var ids = {};
+        mine.forEach(function (c) {
+          Service.resultsForCourse(c.id).forEach(function (r) { ids[r.studentId] = 1; });
+        });
+        return all.filter(function (s) { return ids[s.id]; });
+      }
+      if (user.role === 'department_admin') {
+        return all.filter(function (s) { return s.department === user.department; });
+      }
+      return all;
+    },
+
+    visibleCourses: function (user) {
+      var all = Service.courses();
+      if (user && user.role === 'lecturer') {
+        return all.filter(function (c) { return c.lecturerId === user.id; });
+      }
+      if (user && user.role === 'department_admin') {
+        return all.filter(function (c) { return c.department === user.department; });
+      }
+      return all;
+    },
+
+    /* ---- calculations -------------------------------------------------- */
+    gpa: function (resultList) {
+      var units = sum(resultList.map(function (r) { return r.creditUnit; }));
+      if (!units) { return null; }
+      return round(sum(resultList.map(function (r) { return r.gradePoint * r.creditUnit; })) / units, 2);
+    },
+    cgpa: function (studentId) { return Service.gpa(Service.resultsFor(studentId)); },
+    periodKey: function (r) { return r.session + ' · ' + r.semester; },
+    periodsOrdered: function () {
+      return PERIOD_DEFS.map(function (p) { return { key: p[1] + ' · ' + p[2], session: p[1], semester: p[2] }; });
+    },
+    periodGPA: function (resultList, key) {
+      return Service.gpa(resultList.filter(function (r) { return Service.periodKey(r) === key; }));
+    },
+    creditsEarned: function (resultList, passMark) {
+      return sum(resultList.filter(function (r) { return r.score >= passMark; }).map(function (r) { return r.creditUnit; }));
+    },
+
+    /* Risk score: transparent weighted rule model, 0-100.
+       GPA shortfall (30) + failure proportion (25) + attendance shortfall (20)
+       + declining GPA trend (15) + credit-progress shortfall (10).          */
+    risk: function (student, resultList) {
+      var settings = Service.settings() || {
+        academic: { passMark: 40 },
+        risk: { gpaThreshold: 2.5, attendanceThreshold: 70, decliningThreshold: 0.3 }
+      };
+      var passMark = settings.academic.passMark;
+      var cfg = settings.risk;
+      if (!resultList.length) {
+        return { score: 0, band: 'Low', factors: ['No academic records available'], parts: {}, cgpa: null, failures: 0 };
+      }
+      var cgpa = Service.gpa(resultList) || 0;
+
+      var gpaRisk = clamp((cfg.gpaThreshold - cgpa) / cfg.gpaThreshold, 0, 1) * 30;
+
+      var failures = resultList.filter(function (r) { return r.score < passMark; }).length;
+      var failureRisk = clamp((failures / resultList.length) * 3, 0, 1) * 25;
+
+      var attendanceRisk = clamp((cfg.attendanceThreshold + 5 - student.attendance) / (cfg.attendanceThreshold + 5), 0, 1) * 20;
+
+      var keys = Service.periodsOrdered().map(function (p) { return p.key; });
+      var present = keys.filter(function (k) {
+        return resultList.some(function (r) { return Service.periodKey(r) === k; });
+      });
+      var latest = present.length ? (Service.periodGPA(resultList, present[present.length - 1]) || 0) : 0;
+      var previous = present.length > 1 ? (Service.periodGPA(resultList, present[present.length - 2]) || 0) : latest;
+      var trendRisk = clamp((previous - latest) / 1.0, 0, 1) * 15;
+
+      var expected = EXPECTED_CREDITS[student.level] || 20;
+      var earned = Service.creditsEarned(resultList, passMark);
+      var creditRisk = clamp((expected - earned) / expected, 0, 1) * 10;
+
+      var score = Math.round(clamp(gpaRisk + failureRisk + attendanceRisk + trendRisk + creditRisk, 0, 100));
+      var band = score >= 75 ? 'Critical' : score >= 50 ? 'High' : score >= 25 ? 'Moderate' : 'Low';
+
+      var factors = [];
+      if (cgpa < cfg.gpaThreshold) { factors.push('Low cumulative GPA (' + cgpa.toFixed(2) + ')'); }
+      if (latest < previous - cfg.decliningThreshold) { factors.push('Declining GPA trend'); }
+      if (failures > 0) { factors.push(failures + ' failed course' + (failures > 1 ? 's' : '')); }
+      if (student.attendance < cfg.attendanceThreshold) { factors.push('Low attendance (' + student.attendance + '%)'); }
+      if (earned < expected) { factors.push('Slow credit completion (' + earned + '/' + expected + ' units)'); }
+      if (!factors.length) { factors.push('No significant risk factors detected'); }
+
+      return {
+        score: score, band: band, factors: factors, cgpa: cgpa, failures: failures,
+        parts: {
+          'GPA shortfall': round(gpaRisk, 1),
+          'Failure proportion': round(failureRisk, 1),
+          'Attendance shortfall': round(attendanceRisk, 1),
+          'Declining GPA trend': round(trendRisk, 1),
+          'Credit progress': round(creditRisk, 1)
+        }
+      };
+    },
+
+    /* Rule-based recommendation engine — triggers and actions. */
+    recommendations: function (student, resultList) {
+      var settings = Service.settings();
+      var cfg = settings.risk;
+      var passMark = settings.academic.passMark;
+      var out = [];
+      var cgpa = Service.gpa(resultList) || 0;
+      var failures = resultList.filter(function (r) { return r.score < passMark; }).length;
+      var keys = Service.periodsOrdered().map(function (p) { return p.key; });
+      var present = keys.filter(function (k) { return resultList.some(function (r) { return Service.periodKey(r) === k; }); });
+      var latest = present.length ? (Service.periodGPA(resultList, present[present.length - 1]) || 0) : 0;
+      var previous = present.length > 1 ? (Service.periodGPA(resultList, present[present.length - 2]) || 0) : latest;
+
+      if (cgpa < cfg.gpaThreshold) { out.push({ trigger: 'Low GPA', action: 'Schedule an academic advising session.' }); }
+      if (student.attendance < cfg.attendanceThreshold) { out.push({ trigger: 'Low attendance', action: 'Review attendance barriers and contact the student.' }); }
+      if (failures >= cfg.failureThreshold) { out.push({ trigger: 'Repeated failure', action: 'Recommend targeted tutoring or course support.' }); }
+      if (latest < previous - cfg.decliningThreshold) { out.push({ trigger: 'Declining performance', action: 'Monitor performance closely over the next assessment period.' }); }
+      if (resultList.some(function (r) { return r.score < 35; })) { out.push({ trigger: 'Missing assessments', action: 'Contact the student regarding outstanding assessments.' }); }
+      if (!out.length) { out.push({ trigger: 'On track', action: 'No intervention required; continue routine monitoring.' }); }
+      return out;
+    },
+
+    /* ---- prediction service interface (MVP estimates, rule-based) ------ */
+    predictAcademicRisk: function (student, resultList) {
+      var r = Service.risk(student, resultList);
+      return { value: r.score, band: r.band, label: 'MVP Estimate', method: 'rule-based weighted model' };
+    },
+    predictCourseFailure: function (student, resultList) {
+      var settings = Service.settings();
+      var fail = resultList.filter(function (r) { return r.score < settings.academic.passMark; }).length;
+      return {
+        value: resultList.length ? round((fail / resultList.length) * 100, 1) : 0,
+        label: 'MVP Estimate',
+        method: 'historical failure proportion'
+      };
+    },
+    predictRetentionRisk: function (student) {
+      return { value: student.status === 'inactive' ? 100 : 0, label: 'MVP Estimate', method: 'enrolment status' };
+    },
+    predictExpectedGPA: function (student, resultList) {
+      var keys = Service.periodsOrdered().map(function (p) { return p.key; });
+      var vals = keys.map(function (k) { return Service.periodGPA(resultList, k); }).filter(function (v) { return v !== null; });
+      if (vals.length < 2) {
+        return { value: vals.length ? vals[0] : null, label: 'MVP Estimate', method: 'insufficient history' };
+      }
+      var slope = (vals[vals.length - 1] - vals[0]) / (vals.length - 1);
+      return { value: round(clamp(vals[vals.length - 1] + slope, 0, 5), 2), label: 'MVP Estimate', method: 'linear trend projection' };
+    },
+
+    /* ---- analytics context -------------------------------------------- */
+    context: function (user, filters) {
+      filters = filters || {};
+      var settings = Service.settings();
+      var passMark = settings.academic.passMark;
+      var all = Service.visibleStudents(user);
+      var students = all.slice();
+
+      if (filters.faculty) { students = students.filter(function (s) { return s.faculty === filters.faculty; }); }
+      if (filters.department) { students = students.filter(function (s) { return s.department === filters.department; }); }
+      if (filters.programme) { students = students.filter(function (s) { return s.programme === filters.programme; }); }
+      if (filters.level) { students = students.filter(function (s) { return String(s.level) === String(filters.level); }); }
+      if (filters.gender) { students = students.filter(function (s) { return s.gender === filters.gender; }); }
+      if (filters.session) { students = students.filter(function (s) { return s.session === filters.session; }); }
+      if (filters.status) { students = students.filter(function (s) { return s.status === filters.status; }); }
+
+      var byStudent = {};
+      var allResults = Service.results();
+      allResults.forEach(function (r) {
+        if (!byStudent[r.studentId]) { byStudent[r.studentId] = []; }
+        byStudent[r.studentId].push(r);
+      });
+
+      var enriched = students.map(function (s) {
+        var rs = (byStudent[s.id] || []).slice();
+        var scope = rs.filter(function (r) {
+          if (filters.session && r.session !== filters.session) { return false; }
+          if (filters.semester && r.semester !== filters.semester) { return false; }
+          return true;
+        });
+        var rk = Service.risk(s, scope);
+        return { student: s, results: scope, allResults: rs, risk: rk, cgpa: Service.gpa(scope) };
+      });
+
+      if (filters.risk) { enriched = enriched.filter(function (e) { return e.risk.band === filters.risk; }); }
+      if (filters.minCgpa !== '' && filters.minCgpa !== undefined && filters.minCgpa !== null) {
+        enriched = enriched.filter(function (e) { return e.cgpa !== null && e.cgpa >= Number(filters.minCgpa); });
+      }
+      if (filters.maxCgpa !== '' && filters.maxCgpa !== undefined && filters.maxCgpa !== null) {
+        enriched = enriched.filter(function (e) { return e.cgpa !== null && e.cgpa <= Number(filters.maxCgpa); });
+      }
+
+      var results = [];
+      enriched.forEach(function (e) { results = results.concat(e.results); });
+
+      var gpas = enriched.map(function (e) { return e.cgpa; }).filter(function (v) { return v !== null; });
+      var passed = results.filter(function (r) { return r.score >= passMark; });
+      var failed = results.filter(function (r) { return r.score < passMark; });
+      var active = enriched.filter(function (e) { return e.student.status === 'active'; });
+      var atRisk = enriched.filter(function (e) { return e.risk.band === 'High' || e.risk.band === 'Critical'; });
+      var critical = enriched.filter(function (e) { return e.risk.band === 'Critical'; });
+      var finalYear = enriched.filter(function (e) { return e.student.level === 400; });
+      var ready = finalYear.filter(function (e) {
+        return Service.creditsEarned(e.allResults, passMark) >= settings.academic.requiredCredits * 0.5;
+      });
+
+      var metrics = {
+        totalStudents: enriched.length,
+        activeStudents: active.length,
+        averageGPA: gpas.length ? round(mean(gpas), 2) : null,
+        passRate: results.length ? round(pct(passed.length, results.length), 1) : null,
+        failureRate: results.length ? round(pct(failed.length, results.length), 1) : null,
+        atRiskCount: atRisk.length,
+        criticalCount: critical.length,
+        retentionRate: enriched.length ? round(pct(active.length, enriched.length), 1) : null,
+        graduationRate: finalYear.length ? round(pct(ready.length, finalYear.length), 1) : null,
+        averageCourseScore: results.length ? round(mean(results.map(function (r) { return r.score; })), 1) : null,
+        averageAttendance: results.length ? round(mean(results.map(function (r) { return r.attendance; })), 1) : null,
+        resultCount: results.length
+      };
+
+      return {
+        settings: settings, passMark: passMark, enriched: enriched,
+        students: enriched.map(function (e) { return e.student; }),
+        results: results, metrics: metrics, atRisk: atRisk, ready: ready
+      };
+    },
+
+    /* ---- rule-based insight engine ------------------------------------- */
+    insights: function (ctx) {
+      var out = [];
+      var settings = ctx.settings;
+      var byCourse = groupBy(ctx.results, function (r) { return r.courseId; });
+
+      Object.keys(byCourse).forEach(function (cid) {
+        var course = Service.course(cid);
+        if (!course) { return; }
+        var rs = byCourse[cid];
+        var rate = pct(rs.filter(function (r) { return r.score >= ctx.passMark; }).length, rs.length);
+        if (rate < 60) {
+          out.push({
+            tone: 'bad',
+            text: course.code + ' — pass rate is ' + round(rate, 1) + '% (' + rs.length + ' records). Course performance requires attention.'
+          });
+        }
+      });
+
+      var keys = Service.periodsOrdered().map(function (p) { return p.key; });
+      var trend = keys.map(function (k) {
+        var rs = ctx.results.filter(function (r) { return Service.periodKey(r) === k; });
+        return rs.length ? Service.gpa(rs) : null;
+      }).filter(function (v) { return v !== null; });
+
+      if (trend.length > 1) {
+        var delta = trend[trend.length - 1] - trend[0];
+        if (delta < -0.3) {
+          out.push({ tone: 'warn', text: 'Average GPA has declined by ' + round(Math.abs(delta), 2) + ' points compared with the earliest selected period.' });
+        } else if (delta > 0.3) {
+          out.push({ tone: 'good', text: 'Average GPA has improved by ' + round(delta, 2) + ' points across the selected periods.' });
+        }
+      }
+
+      if (ctx.metrics.averageAttendance !== null && ctx.metrics.averageAttendance < settings.academic.attendanceThreshold) {
+        out.push({
+          tone: 'warn',
+          text: 'Average attendance (' + ctx.metrics.averageAttendance + '%) is below the configured threshold of ' + settings.academic.attendanceThreshold + '%.'
+        });
+      }
+      if (ctx.metrics.criticalCount > 0) {
+        out.push({
+          tone: 'bad',
+          text: ctx.metrics.criticalCount + ' student' + (ctx.metrics.criticalCount > 1 ? 's are' : ' is') +
+            ' in the Critical risk band. Immediate academic intervention recommended.'
+        });
+      }
+      if (ctx.metrics.failureRate !== null && ctx.metrics.failureRate > 25) {
+        out.push({ tone: 'warn', text: 'Failure rate is ' + ctx.metrics.failureRate + '%, which exceeds 25% for the current selection.' });
+      }
+
+      /* Attendance vs performance — computed, never asserted. */
+      var low = ctx.results.filter(function (r) { return r.attendance < settings.academic.attendanceThreshold; });
+      var rest = ctx.results.filter(function (r) { return r.attendance >= settings.academic.attendanceThreshold; });
+      if (low.length && rest.length) {
+        var f1 = pct(low.filter(function (r) { return r.score < ctx.passMark; }).length, low.length);
+        var f2 = pct(rest.filter(function (r) { return r.score < ctx.passMark; }).length, rest.length);
+        out.push({
+          tone: f1 > f2 ? 'warn' : 'good',
+          text: 'Students with attendance below ' + settings.academic.attendanceThreshold + '% show a ' + round(f1, 1) +
+            '% failure rate, compared with ' + round(f2, 1) + '% for those at or above it, in the selected dataset.'
+        });
+      }
+
+      if (!out.length) { out.push({ tone: 'good', text: 'No threshold breaches detected in the current selection.' }); }
+      return out;
+    },
+
+    /* ---- alert generation ---------------------------------------------- */
+    generateAlerts: function () {
+      var settings = Service.settings();
+      var alerts = [];
+      var courses = Service.courses();
+      var results = Service.results();
+      var students = Service.students();
+
+      courses.forEach(function (c) {
+        var rs = results.filter(function (r) { return r.courseId === c.id; });
+        var below = rs.filter(function (r) { return r.score < settings.academic.passMark; });
+        if (below.length >= 3) {
+          alerts.push({
+            id: uid('ALT'), type: 'Course failure alert',
+            severity: below.length >= 6 ? 'Critical' : 'High',
+            title: below.length + ' students in ' + c.code + ' have fallen below the performance threshold.',
+            detail: c.title + ' — ' + rs.length + ' records assessed.',
+            target: '#/course/' + c.id, date: new Date().toISOString(), read: false
+          });
+        }
+      });
+
+      var keys = Service.periodsOrdered().map(function (p) { return p.key; });
+      if (keys.length >= 2) {
+        var pen = keys[keys.length - 2], last = keys[keys.length - 1];
+        var depts = Service.departments();
+        depts.forEach(function (d) {
+          var cids = courses.filter(function (c) { return c.department === d.name; }).map(function (c) { return c.id; });
+          var before = results.filter(function (r) { return cids.indexOf(r.courseId) >= 0 && Service.periodKey(r) === pen; });
+          var after = results.filter(function (r) { return cids.indexOf(r.courseId) >= 0 && Service.periodKey(r) === last; });
+          if (!before.length || !after.length) { return; }
+          var fr1 = pct(before.filter(function (r) { return r.score < settings.academic.passMark; }).length, before.length);
+          var fr2 = pct(after.filter(function (r) { return r.score < settings.academic.passMark; }).length, after.length);
+          if (fr2 - fr1 > 2) {
+            alerts.push({
+              id: uid('ALT'), type: 'Performance threshold exceeded', severity: 'High',
+              title: 'Department of ' + d.name + ' failure rate increased by ' + round(fr2 - fr1, 1) + '% between the last two periods.',
+              detail: pen + ' → ' + last, target: '#/departments', date: new Date().toISOString(), read: false
+            });
+          }
+        });
+      }
+
+      var atRisk = students.filter(function (s) {
+        var rs = Service.resultsFor(s.id);
+        var rk = Service.risk(s, rs);
+        return rk.band === 'High' || rk.band === 'Critical';
+      });
+      if (atRisk.length) {
+        alerts.push({
+          id: uid('ALT'), type: 'At-risk student alert',
+          severity: atRisk.length > 20 ? 'Critical' : 'High',
+          title: atRisk.length + ' students require academic intervention.',
+          detail: 'Calculated from the current dataset using the MVP rule-based risk model.',
+          target: '#/at-risk', date: new Date().toISOString(), read: false
+        });
+      }
+      return alerts;
+    },
+
+    /* ---- notifications -------------------------------------------------- */
+    createNotification: function (type, title, body, target) {
+      var list = Service.notifications();
+      list.unshift({
+        id: uid('NTF'), type: type, title: title, body: body,
+        target: target || '', date: new Date().toISOString(), read: false
+      });
+      Service.saveNotifications(list);
+    },
+    unreadCount: function () {
+      return Service.notifications().filter(function (n) { return !n.read; }).length +
+        Service.alerts().filter(function (a) { return !a.read; }).length;
+    },
+
+    /* ---- CSV validation and import ------------------------------------- */
+    requiredColumns: ['student_id', 'student_name', 'faculty', 'department', 'programme', 'level',
+      'session', 'semester', 'course_code', 'course_title', 'credit_unit', 'score', 'grade',
+      'attendance', 'assessment_score', 'exam_score'],
+
+    parseCSV: function (text) {
+      var rows = [], row = [], field = '', inQ = false;
+      text = String(text).replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+      for (var i = 0; i < text.length; i++) {
+        var c = text[i];
+        if (inQ) {
+          if (c === '"') {
+            if (text[i + 1] === '"') { field += '"'; i++; }
+            else { inQ = false; }
+          } else { field += c; }
+          continue;
+        }
+        if (c === '"') { inQ = true; continue; }
+        if (c === ',') { row.push(field); field = ''; continue; }
+        if (c === '\n') { row.push(field); rows.push(row); row = []; field = ''; continue; }
+        field += c;
+      }
+      if (field !== '' || row.length) { row.push(field); rows.push(row); }
+      return rows.filter(function (r) { return !(r.length === 1 && String(r[0]).trim() === ''); });
+    },
+
+    validateImport: function (text) {
+      var settings = Service.settings();
+      var scale = settings.academic.gradingScale;
+      var rows = Service.parseCSV(text);
+      if (!rows.length) { return { ok: false, error: 'The file appears to be empty.' }; }
+      var headers = rows[0].map(function (h) { return String(h).trim().toLowerCase(); });
+      var missing = Service.requiredColumns.filter(function (c) { return headers.indexOf(c) < 0; });
+      if (missing.length) {
+        return { ok: false, error: 'The file is missing required columns: ' + missing.join(', ') + '.' };
+      }
+      var body = rows.slice(1);
+      var seen = {};
+      var validated = [];
+
+      body.forEach(function (raw, i) {
+        var rec = {};
+        headers.forEach(function (h, idx) { rec[h] = raw[idx] === undefined ? '' : String(raw[idx]).trim(); });
+        var errors = [];
+
+        if (!rec.student_id) { errors.push('Missing student_id'); }
+        if (!rec.student_name) { errors.push('Missing student_name'); }
+        if (!rec.course_code) { errors.push('Missing course_code'); }
+        if (rec.level && [100, 200, 300, 400].indexOf(Number(rec.level)) < 0) { errors.push('Invalid level'); }
+
+        var score = Number(rec.score);
+        if (rec.score === '' || isNaN(score)) { errors.push('Score missing or non-numeric'); }
+        else if (score < 0 || score > 100) { errors.push('Score must be 0-100'); }
+
+        if (rec.attendance !== '' && rec.attendance !== undefined) {
+          var at = Number(rec.attendance);
+          if (isNaN(at) || at < 0 || at > 100) { errors.push('Attendance must be 0-100'); }
+        }
+        var cu = Number(rec.credit_unit);
+        if (rec.credit_unit === '' || isNaN(cu) || cu <= 0) { errors.push('Credit units must be greater than 0'); }
+        if (rec.semester && ['First', 'Second'].indexOf(rec.semester) < 0) { errors.push('Invalid semester'); }
+        if (rec.session && !/^\d{4}\/\d{4}$/.test(rec.session)) { errors.push('Invalid session (expected YYYY/YYYY)'); }
+        if (rec.grade && scale.map(function (g) { return g.grade; }).indexOf(rec.grade.toUpperCase()) < 0) { errors.push('Invalid grade'); }
+
+        var key = [rec.student_id, rec.course_code, rec.session, rec.semester].join('|');
+        if (seen[key]) { errors.push('Duplicate record'); }
+        seen[key] = true;
+
+        validated.push({ line: i + 2, record: rec, errors: errors, raw: raw });
+      });
+
+      var accepted = validated.filter(function (v) { return !v.errors.length; });
+      var rejected = validated.filter(function (v) { return v.errors.length; });
+      return {
+        ok: true, headers: headers, missingColumns: missing,
+        total: body.length, accepted: accepted, rejected: rejected,
+        duplicates: rejected.filter(function (r) { return r.errors.indexOf('Duplicate record') >= 0; }).length,
+        missingValues: rejected.filter(function (r) {
+          return r.errors.some(function (e) { return e.indexOf('Missing') === 0; });
+        }).length,
+        invalidRecords: rejected.filter(function (r) {
+          return r.errors.some(function (e) {
+            return e.indexOf('Invalid') === 0 || e.indexOf('must be') >= 0 || e.indexOf('non-numeric') >= 0;
+          });
+        }).length
+      };
+    },
+
+    commitImport: function (validation) {
+      var settings = Service.settings();
+      var students = Service.students().slice();
+      var courses = Service.courses().slice();
+      var results = Service.results().slice();
+      var createdStudents = 0, createdCourses = 0, stored = 0;
+      var maxRes = results.reduce(function (m, r) {
+        return Math.max(m, Number(String(r.id).replace(/\D/g, '')) || 0);
+      }, 0);
+
+      validation.accepted.forEach(function (v) {
+        var rec = v.record;
+        var st = students.filter(function (s) { return s.studentId === rec.student_id; })[0];
+        if (!st) {
+          st = {
+            id: 'STU' + pad(students.length + 1, 3), studentId: rec.student_id,
+            name: rec.student_name || 'Imported Student', gender: '',
+            email: slug(rec.student_name || 'imported') + '@student.academiciq.demo',
+            programme: rec.programme || '', department: rec.department || '', faculty: rec.faculty || '',
+            level: Number(rec.level) || 100, session: rec.session || '2025/2026',
+            attendance: Number(rec.attendance) || 0, ability: 0.5, status: 'active',
+            createdAt: new Date().toISOString()
+          };
+          students.push(st); createdStudents++;
+        }
+        var crs = courses.filter(function (c) { return c.code.toUpperCase() === String(rec.course_code).toUpperCase(); })[0];
+        if (!crs) {
+          crs = {
+            id: 'CRS' + pad(courses.length + 1, 3), code: rec.course_code.toUpperCase(),
+            title: rec.course_title || rec.course_code, department: rec.department || st.department,
+            creditUnit: Number(rec.credit_unit) || 3, level: Number(rec.level) || st.level, lecturerId: ''
+          };
+          courses.push(crs); createdCourses++;
+        }
+        var score = clamp(Number(rec.score), 0, 100);
+        var band = gradeFor(score, settings.academic.gradingScale);
+        maxRes++;
+        results.push({
+          id: 'RES' + pad(maxRes, 4), studentId: st.id, courseId: crs.id,
+          session: rec.session, semester: rec.semester, score: score,
+          grade: rec.grade ? rec.grade.toUpperCase() : band.grade,
+          gradePoint: band.point, creditUnit: Number(rec.credit_unit) || crs.creditUnit,
+          attendance: rec.attendance === '' ? 0 : Number(rec.attendance),
+          assessmentScore: Number(rec.assessment_score) || 0,
+          examScore: Number(rec.exam_score) || 0,
+          imported: true, createdAt: new Date().toISOString()
+        });
+        stored++;
+      });
+
+      /* recompute student attendance from the full record set */
+      students.forEach(function (s) {
+        var rs = results.filter(function (r) { return r.studentId === s.id; });
+        if (rs.length) { s.attendance = Math.round(mean(rs.map(function (r) { return r.attendance; }))); }
+      });
+
+      Service.saveStudents(students);
+      Service.saveCourses(courses);
+      Service.saveResults(results);
+      Service.audit('Data imported', 'sc_results',
+        stored + ' result records stored; ' + createdStudents + ' students and ' + createdCourses + ' courses created.');
+      Service.createNotification('Data import completed', 'Data import completed',
+        stored + ' records stored, ' + validation.rejected.length + ' rejected.', '#/data-import');
+      Store.set('sc_alerts', Service.generateAlerts());
+
+      return { stored: stored, createdStudents: createdStudents, createdCourses: createdCourses, rejected: validation.rejected.length };
+    },
+
+    sampleCSV: function () {
+      var lines = [Service.requiredColumns.join(',')];
+      var settings = Service.settings();
+      var students = Service.students();
+      var courses = Service.courses();
+      for (var i = 0; i < 3; i++) {
+        var s = students[i];
+        var c = courses[i % courses.length];
+        var score = 62 + i * 8;
+        var g = gradeFor(score, settings.academic.gradingScale);
+        lines.push([s.studentId, s.name, s.faculty, s.department, s.programme, s.level, '2025/2026', 'Second',
+          c.code, c.title, c.creditUnit, score, g.grade, 80 + i,
+          Math.round(score * 0.4), score - Math.round(score * 0.4)].join(','));
+      }
+      return lines.join('\n');
+    }
+  };
+
+  /* ======================================================================
+     8. AUTHENTICATION (demonstration only — see security note at top)
+     ====================================================================== */
+  var Auth = {
+    current: function () {
+      return Store.get('sc_current_user', null) || Session.get('sc_current_user', null);
+    },
+    signIn: function (email, password, remember) {
+      var users = Service.users();
+      var u = users.filter(function (x) { return x.email.toLowerCase() === String(email).trim().toLowerCase(); })[0];
+      if (!u) { return { ok: false, error: 'No account found for that university email or ID.' }; }
+      if (u.status !== 'active') { return { ok: false, error: 'This account has been suspended.' }; }
+      if (u.password !== password) {
+        Service.audit('Failed login attempt', u.email, 'Incorrect password supplied');
+        return { ok: false, error: 'Incorrect password. Please try again.' };
+      }
+      var session = {};
+      Object.keys(u).forEach(function (k) { if (k !== 'password') { session[k] = u[k]; } });
+      session.lastLogin = new Date().toISOString();
+      Service.saveUsers(users.map(function (x) {
+        if (x.id === u.id) {
+          var y = {};
+          Object.keys(x).forEach(function (k) { y[k] = x[k]; });
+          y.lastLogin = session.lastLogin;
+          return y;
+        }
+        return x;
+      }));
+      if (remember) { Store.set('sc_current_user', session); }
+      else { Session.set('sc_current_user', session); }
+      Service.audit('User login', u.email, ROLE_LABEL[u.role] + ' signed in');
+      return { ok: true, user: session };
+    },
+    register: function (payload) {
+      var users = Service.users();
+      if (users.some(function (u) { return u.email.toLowerCase() === payload.email.toLowerCase(); })) {
+        return { ok: false, error: 'An account already exists for that email address.' };
+      }
+      var u = {
+        id: 'USR' + pad(users.length + 1, 3), name: payload.name, email: payload.email, password: payload.password,
+        role: payload.role, faculty: payload.faculty || '', department: payload.department || '',
+        programme: payload.programme || '', level: payload.level || null, phone: payload.phone || '',
+        universityId: payload.universityId || '', linkedId: '', status: 'active', lastLogin: '',
+        createdAt: new Date().toISOString()
+      };
+      users.push(u);
+      Service.saveUsers(users);
+      Service.audit('User created', u.email, 'Self-registration as ' + ROLE_LABEL[u.role]);
+      return { ok: true, user: u };
+    },
+    signOut: function () {
+      var u = Auth.current();
+      if (u) { Service.audit('User sign out', u.email, 'Signed out'); }
+      Store.remove('sc_current_user');
+      Session.remove('sc_current_user');
+    },
+    updateProfile: function (patch) {
+      var u = Auth.current();
+      if (!u) { return; }
+      var users = Service.users();
+      Service.saveUsers(users.map(function (x) {
+        if (x.id !== u.id) { return x; }
+        var y = {};
+        Object.keys(x).forEach(function (k) { y[k] = x[k]; });
+        Object.keys(patch).forEach(function (k) { y[k] = patch[k]; });
+        return y;
+      }));
+      var next = {};
+      Object.keys(u).forEach(function (k) { next[k] = u[k]; });
+      Object.keys(patch).forEach(function (k) { next[k] = patch[k]; });
+      if (Store.get('sc_current_user', null)) { Store.set('sc_current_user', next); }
+      else { Session.set('sc_current_user', next); }
+    }
+  };
+
+  /* ======================================================================
+     9. APPLICATION STATE (filters, theme, paging)
+     ====================================================================== */
+  var State = {
+    filters: {
+      session: '', semester: '', faculty: '', department: '', programme: '',
+      level: '', gender: '', status: '', risk: '', minCgpa: '', maxCgpa: ''
+    },
+    query: '',
+    theme: 'light',
+    page: 1,
+    pageSize: 10,
+    importValidation: null,
+    reportType: 'University Performance Report',
+    reportGenerated: null,
+    activeTab: {}
+  };
+
+  function activeFilterList() {
+    var labels = {
+      session: 'Session', semester: 'Semester', faculty: 'Faculty', department: 'Department',
+      programme: 'Programme', level: 'Level', gender: 'Gender', status: 'Status',
+      risk: 'Risk', minCgpa: 'Min CGPA', maxCgpa: 'Max CGPA'
+    };
+    var out = [];
+    Object.keys(State.filters).forEach(function (k) {
+      if (State.filters[k] !== '' && State.filters[k] !== null && State.filters[k] !== undefined) {
+        out.push({ key: k, label: labels[k] || k, value: State.filters[k] });
+      }
+    });
+    return out;
+  }
+
+  function filterBarHtml() {
+    var s = State.filters;
+    var faculties = Service.faculties();
+    var departments = Service.departments();
+    var programmes = Service.programmes();
+    function opts(list, val, labelFn) {
+      return '<option value="">All</option>' + list.map(function (o) {
+        var v = labelFn ? labelFn(o) : o;
+        return '<option value="' + esc(v) + '"' + (String(val) === String(v) ? ' selected' : '') + '>' + esc(v) + '</option>';
+      }).join('');
+    }
+    var active = activeFilterList();
+    return '<div class="card tight"><div class="filters">' +
+      '<div><label for="f-session">Academic session</label><select id="f-session" data-filter="session">' +
+        opts(['2024/2025', '2025/2026'], s.session) + '</select></div>' +
+      '<div><label for="f-semester">Semester</label><select id="f-semester" data-filter="semester">' +
+        opts(['First', 'Second'], s.semester) + '</select></div>' +
+      '<div><label for="f-faculty">Faculty</label><select id="f-faculty" data-filter="faculty">' +
+        opts(faculties, s.faculty, function (f) { return f.name; }) + '</select></div>' +
+      '<div><label for="f-dept">Department</label><select id="f-dept" data-filter="department">' +
+        opts(departments, s.department, function (d) { return d.name; }) + '</select></div>' +
+      '<div><label for="f-prog">Programme</label><select id="f-prog" data-filter="programme">' +
+        opts(programmes, s.programme, function (p) { return p.name; }) + '</select></div>' +
+      '<div><label for="f-level">Level</label><select id="f-level" data-filter="level">' +
+        opts(['100', '200', '300', '400'], s.level) + '</select></div>' +
+      '<div><label for="f-risk">Risk band</label><select id="f-risk" data-filter="risk">' +
+        opts(['Low', 'Moderate', 'High', 'Critical'], s.risk) + '</select></div>' +
+      '<div><label for="f-min">Min CGPA</label><input id="f-min" type="number" min="0" max="5" step="0.1" data-filter="minCgpa" value="' + esc(s.minCgpa) + '"></div>' +
+      '<div><label for="f-max">Max CGPA</label><input id="f-max" type="number" min="0" max="5" step="0.1" data-filter="maxCgpa" value="' + esc(s.maxCgpa) + '"></div>' +
+      '<div><label>&nbsp;</label><button class="btn btn-block" data-act="clear-filters">Clear filters</button></div>' +
+    '</div>' +
+    (active.length
+      ? '<div class="chips"><strong style="font-size:.74rem;color:var(--muted)">Active (' + active.length + '):</strong>' +
+        active.map(function (a) { return '<span class="chip">' + esc(a.label) + ': ' + esc(a.value) + '</span>'; }).join('') + '</div>'
+      : '') +
+    '</div>';
+  }
+
+  function bindFilters(scope) {
+    $$('[data-filter]', scope).forEach(function (el) {
+      el.addEventListener('change', function () {
+        State.filters[el.getAttribute('data-filter')] = el.value;
+        State.page = 1;
+        render();
+      });
+    });
+  }
+
+  /* ======================================================================
+     10. PAGE BUILDERS
+     Each returns { title, subtitle, html, mount }
+     ====================================================================== */
+  var Pages = {};
+
+  /* ---- dashboard ----------------------------------------------------- */
+  Pages.dashboard = function (user) {
+    var ctx = Service.context(user, State.filters);
+    var m = ctx.metrics;
+
+    if (user.role === 'student') {
+      var st = Service.student(user.linkedId);
+      if (!st) { return { title: 'My Performance', subtitle: '', html: UI.error('No student record is linked to this account.') }; }
+      var rs = Service.resultsFor(st.id);
+      var rk = Service.risk(st, rs);
+      var recos = Service.recommendations(st, rs);
+      var keys = Service.periodsOrdered().map(function (p) { return p.key; });
+      var gpaSeries = keys.map(function (k) { return Service.periodGPA(rs, k); });
+      var labels = keys.filter(function (k, i) { return gpaSeries[i] !== null; });
+      var values = gpaSeries.filter(function (v) { return v !== null; });
+      var earned = Service.creditsEarned(rs, ctx.passMark);
+      var required = ctx.settings.academic.requiredCredits;
+      var latest = Service.periodGPA(rs, keys[keys.length - 1]);
+
+      var html = '<div class="grid g-kpi">' +
+        UI.kpi('Current GPA', latest === null ? '—' : latest.toFixed(2), 'Most recent period', 'info') +
+        UI.kpi('CGPA', Service.gpa(rs) === null ? '—' : Service.gpa(rs).toFixed(2), 'Credit-weighted cumulative average', 'teal') +
+        UI.kpi('Credits earned', num(earned), 'Required: ' + required, '') +
+        UI.kpi('Attendance', st.attendance + '%', 'Threshold: ' + ctx.settings.academic.attendanceThreshold + '%',
+          st.attendance < ctx.settings.academic.attendanceThreshold ? 'warn' : 'good') +
+        UI.kpi('Risk score', rk.score + ' / 100', rk.band + ' band',
+          rk.band === 'Critical' || rk.band === 'High' ? 'bad' : rk.band === 'Moderate' ? 'warn' : 'good') +
+        '</div>';
+
+      html += '<div class="card"><div class="card-head"><h2>My GPA trend</h2></div>' +
+        Charts.line({ labels: labels, series: [{ name: 'GPA', values: values }], yMax: 5, title: 'My GPA trend' }) + '</div>';
+
+      html += '<div class="grid g-2">' +
+        '<div class="card"><div class="card-head"><h2>Progress</h2></div>' +
+          '<p class="hint">Credits earned against the ' + required + ' required for graduation.</p>' +
+          Charts.progressList([{
+            label: 'Credits earned',
+            value: (earned / required) * 100,
+            display: round((earned / required) * 100, 1) + '%'
+          }], { max: 100, toneFn: function () { return 'good'; } }) +
+        '</div>' +
+        '<div class="card"><div class="card-head"><h2>Risk analysis</h2></div>' +
+          '<p>' + UI.riskBadge(rk.band) + ' <strong>' + rk.score + '/100</strong></p>' +
+          '<p class="hint">MVP rule-based model — not a validated predictive model.</p>' +
+          '<h3>Main risk factors</h3><ul>' + rk.factors.map(function (f) { return '<li>' + esc(f) + '</li>'; }).join('') + '</ul>' +
+        '</div>' +
+      '</div>';
+
+      html += '<div class="card"><div class="card-head"><h2>Smart Recommendations</h2>' +
+        '<span class="tag-demo">MVP Estimate</span></div>' +
+        recos.map(function (r) {
+          return '<div class="reco"><div class="r-trigger">' + esc(r.trigger) + '</div>' +
+            '<div class="r-action">' + esc(r.action) + '</div></div>';
+        }).join('') + '</div>';
+
+      html += '<div class="card"><div class="card-head"><h2>My course results</h2>' +
+        '<div class="spacer"></div><button class="btn btn-sm" data-act="export-results" data-id="' + st.id + '">Export CSV</button></div>' +
+        UI.table(
+          [{ label: 'Course' }, { label: 'Session' }, { label: 'Semester' }, { label: 'Units', num: true },
+           { label: 'Score', num: true }, { label: 'Grade' }, { label: 'Attendance', num: true }, { label: 'Status' }],
+          rs.map(function (r) {
+            var c = Service.course(r.courseId);
+            return [esc(c ? c.code : '—'), esc(r.session), esc(r.semester), r.creditUnit, r.score,
+              UI.gradeBadge(r.grade), r.attendance + '%',
+              r.score >= ctx.passMark ? '<span class="badge b-good">Passed</span>' : '<span class="badge b-bad">Failed</span>'];
+          })
+        ) + '</div>';
+
+      return { title: 'My Performance', subtitle: st.programme + ' · ' + st.department + ' · Level ' + st.level, html: html };
+    }
+
+    var insights = Service.insights(ctx);
+    var keys2 = Service.periodsOrdered().map(function (p) { return p.key; });
+    var gpaTrend = keys2.map(function (k) {
+      var rs2 = ctx.results.filter(function (r) { return Service.periodKey(r) === k; });
+      return rs2.length ? Service.gpa(rs2) : null;
+    });
+    var trendLabels = keys2.filter(function (k, i) { return gpaTrend[i] !== null; });
+    var trendValues = gpaTrend.filter(function (v) { return v !== null; });
+
+    var passBySem = keys2.map(function (k) {
+      var rs3 = ctx.results.filter(function (r) { return Service.periodKey(r) === k; });
+      return rs3.length ? pct(rs3.filter(function (r) { return r.score >= ctx.passMark; }).length, rs3.length) : 0;
+    });
+
+    var byFaculty = groupBy(ctx.results, function (r) {
+      var s = byId(ctx.students, r.studentId);
+      return s ? s.faculty : 'Unknown';
+    });
+    var facLabels = Object.keys(byFaculty);
+    var facValues = facLabels.map(function (f) {
+      var ids = {};
+      byFaculty[f].forEach(function (r) { ids[r.studentId] = 1; });
+      var list = Object.keys(ids).map(function (id) { return Service.cgpa(id); }).filter(function (v) { return v !== null; });
+      return list.length ? round(mean(list), 2) : 0;
+    });
+
+    var byDept = groupBy(ctx.results, function (r) {
+      var s = byId(ctx.students, r.studentId);
+      return s ? s.department : 'Unknown';
+    });
+    var deptLabels = Object.keys(byDept);
+    var deptValues = deptLabels.map(function (d) {
+      return pct(byDept[d].filter(function (r) { return r.score >= ctx.passMark; }).length, byDept[d].length);
+    });
+
+    var byLevel = groupBy(ctx.results, function (r) {
+      var s = byId(ctx.students, r.studentId);
+      return s ? s.level : 0;
+    });
+    var lvlLabels = Object.keys(byLevel).sort();
+    var lvlValues = lvlLabels.map(function (l) {
+      var ids = {};
+      byLevel[l].forEach(function (r) { ids[r.studentId] = 1; });
+      var gpas = Object.keys(ids).map(function (id) { return Service.cgpa(id); }).filter(function (v) { return v !== null; });
+      return gpas.length ? round(mean(gpas), 2) : 0;
+    });
+
+    var gradeCounts = { A: 0, B: 0, C: 0, D: 0, E: 0, F: 0 };
+    ctx.results.forEach(function (r) { if (gradeCounts[r.grade] !== undefined) { gradeCounts[r.grade]++; } });
+
+    var atRiskTrend = keys2.map(function (k) {
+      return ctx.enriched.filter(function (e) {
+        var rs4 = e.allResults.filter(function (r) { return Service.periodKey(r) === k; });
+        if (!rs4.length) { return false; }
+        var band = Service.risk(e.student, rs4).band;
+        return band === 'High' || band === 'Critical';
+      }).length;
+    });
+
+    var html2 = '<div class="grid g-kpi">' +
+      UI.kpi('Total students', num(m.totalStudents), 'Within your authorised scope', 'info') +
+      UI.kpi('Active students', num(m.activeStudents), 'Status: active', 'good') +
+      UI.kpi('Average GPA', m.averageGPA === null ? '—' : m.averageGPA.toFixed(2), 'Calculated credit-weighted average', 'teal') +
+      UI.kpi('Pass rate', m.passRate === null ? '—' : m.passRate + '%', 'Score ≥ ' + ctx.passMark + ' on ' + num(m.resultCount) + ' records',
+        m.passRate !== null && m.passRate < 60 ? 'bad' : 'good') +
+      UI.kpi('At-risk students', num(m.atRiskCount), 'High and Critical bands', m.atRiskCount > 0 ? 'warn' : 'good') +
+      UI.kpi('Retention rate', m.retentionRate === null ? '—' : m.retentionRate + '%', 'Active ÷ total students', '') +
+      UI.kpi('Graduation rate', m.graduationRate === null ? '—' : m.graduationRate + '%',
+        'Level 400 meeting half the credit requirement', '') +
+      UI.kpi('Average course score', m.averageCourseScore === null ? '—' : m.averageCourseScore,
+        'Mean of ' + num(m.resultCount) + ' assessment scores', '') +
+    '</div>';
+
+    html2 += '<div class="card"><div class="card-head"><h2>Smart insights</h2><div class="spacer"></div>' +
+      '<span class="tag-demo">Calculated from the dataset</span></div>' + UI.insights(insights) + '</div>';
+
+    html2 += '<div class="grid g-2">' +
+      '<div class="card"><div class="card-head"><h2>GPA trend over time</h2></div>' +
+        Charts.line({ labels: trendLabels, series: [{ name: 'Average GPA', values: trendValues }], yMax: 5, title: 'GPA trend over time' }) + '</div>' +
+      '<div class="card"><div class="card-head"><h2>Pass rate by semester</h2></div>' +
+        Charts.bar({ labels: keys2, values: passBySem, yMax: 100, title: 'Pass rate by semester' }) + '</div>' +
+      '<div class="card"><div class="card-head"><h2>Performance by faculty (average GPA)</h2></div>' +
+        Charts.bar({ labels: facLabels, values: facValues, yMax: 5, title: 'Performance by faculty' }) + '</div>' +
+      '<div class="card"><div class="card-head"><h2>Performance by department (pass rate %)</h2></div>' +
+        Charts.bar({ labels: deptLabels, values: deptValues, yMax: 100, title: 'Performance by department' }) + '</div>' +
+      '<div class="card"><div class="card-head"><h2>Performance by level (average GPA)</h2></div>' +
+        Charts.bar({ labels: lvlLabels, values: lvlValues, yMax: 5, title: 'Performance by level' }) + '</div>' +
+      '<div class="card"><div class="card-head"><h2>Grade distribution</h2></div>' +
+        Charts.donut({
+          segments: Object.keys(gradeCounts).map(function (g) { return { label: g, value: gradeCounts[g] }; }),
+          title: 'Grade distribution', unit: 'results'
+        }) + '</div>' +
+      '<div class="card"><div class="card-head"><h2>At-risk trend</h2></div>' +
+        Charts.line({ labels: keys2, series: [{ name: 'At-risk students', values: atRiskTrend }], yMax: Math.max(10, m.totalStudents), title: 'At-risk trend' }) + '</div>' +
+      '<div class="card"><div class="card-head"><h2>Attendance vs performance</h2></div>' +
+        (function () {
+          var below = ctx.results.filter(function (r) { return r.attendance < ctx.settings.academic.attendanceThreshold; });
+          var above = ctx.results.filter(function (r) { return r.attendance >= ctx.settings.academic.attendanceThreshold; });
+          return Charts.bar({
+            labels: ['Below ' + ctx.settings.academic.attendanceThreshold + '%', 'At or above'],
+            values: [
+              below.length ? round(mean(below.map(function (r) { return r.score; })), 1) : 0,
+              above.length ? round(mean(above.map(function (r) { return r.score; })), 1) : 0
+            ],
+            yMax: 100, title: 'Attendance vs performance', colors: ['#b45309', '#0f766e']
+          }) + '<p class="hint">Mean assessment score by attendance group, computed from the selected dataset.</p>';
+        })() + '</div>' +
+    '</div>';
+
+    return {
+      title: 'Executive Dashboard',
+      subtitle: 'Calculated live from stored academic records. No figure on this page is hard-coded.',
+      html: html2
+    };
+  };
+
+  /* ---- students ------------------------------------------------------ */
+  Pages.students = function (user) {
+    var ctx = Service.context(user, State.filters);
+    var q = (State.query || '').toLowerCase();
+    var rows = ctx.enriched.slice();
+    if (q) {
+      rows = rows.filter(function (e) {
+        return (e.student.name + ' ' + e.student.studentId + ' ' + e.student.email + ' ' + e.student.programme)
+          .toLowerCase().indexOf(q) >= 0;
+      });
+    }
+    rows.sort(function (a, b) { return a.student.name < b.student.name ? -1 : 1; });
+
+    var total = rows.length;
+    var pages = Math.max(1, Math.ceil(total / State.pageSize));
+    if (State.page > pages) { State.page = pages; }
+    var start = (State.page - 1) * State.pageSize;
+    var slice = rows.slice(start, start + State.pageSize);
+
+    var tableRows = slice.map(function (e) {
+      var s = e.student;
+      return [
+        esc(s.studentId), '<a href="#/student/' + s.id + '">' + esc(s.name) + '</a>', esc(s.programme),
+        esc(s.department), s.level,
+        e.cgpa === null ? '—' : e.cgpa.toFixed(2),
+        s.attendance + '%', UI.riskBadge(e.risk.band), UI.statusBadge(s.status),
+        '<button class="btn btn-sm" data-act="view-student" data-id="' + s.id + '">View</button>'
+      ];
+    });
+
+    var html = '<div class="card tight"><div class="filters" style="grid-template-columns:2fr auto">' +
+      '<div><label for="stu-search">Search name, student ID, email or programme</label>' +
+      '<input id="stu-search" type="text" data-act="student-search" value="' + esc(State.query || '') + '" placeholder="e.g. Amina, UNI/2023/001"></div>' +
+      '<div><label>&nbsp;</label><button class="btn btn-block" data-act="export-students">Export CSV</button></div>' +
+      '</div></div>';
+
+    html += filterBarHtml();
+    html += '<div class="card"><div class="card-head"><h2>Student directory</h2><div class="spacer"></div>' +
+      '<span class="hint">' + num(total) + ' record(s)</span></div>' +
+      UI.table(
+        [{ label: 'Student ID' }, { label: 'Name' }, { label: 'Programme' }, { label: 'Department' },
+         { label: 'Level', num: true }, { label: 'CGPA', num: true }, { label: 'Attendance', num: true },
+         { label: 'Risk' }, { label: 'Status' }, { label: 'Actions' }],
+        tableRows) +
+      '<div class="pager"><span class="pinfo">Page ' + State.page + ' of ' + pages + '</span>' +
+        '<button data-act="page-prev"' + (State.page <= 1 ? ' disabled' : '') + '>Previous</button>' +
+        '<button data-act="page-next"' + (State.page >= pages ? ' disabled' : '') + '>Next</button>' +
+      '</div></div>';
+
+    return {
+      title: 'Students',
+      subtitle: 'Role-scoped student records with calculated CGPA, attendance and risk band.',
+      html: html
+    };
+  };
+
+  /* ---- student profile ----------------------------------------------- */
+  Pages.studentProfile = function (user, id) {
+    var st = Service.student(id);
+    if (!st) { return { title: 'Student', subtitle: '', html: UI.error('That student record does not exist.') }; }
+    if (user.role === 'student' && user.linkedId !== st.id) { return { title: 'Student', subtitle: '', html: UI.denied() }; }
+
+    Service.audit('Student record viewed', st.studentId, 'Profile opened');
+    var rs = Service.resultsFor(st.id);
+    var settings = Service.settings();
+    var rk = Service.risk(st, rs);
+    var recos = Service.recommendations(st, rs);
+    var keys = Service.periodsOrdered().map(function (p) { return p.key; });
+    var trendVals = keys.map(function (k) { return Service.periodGPA(rs, k); });
+    var trendLabels = keys.filter(function (k, i) { return trendVals[i] !== null; });
+    var trendClean = trendVals.filter(function (v) { return v !== null; });
+    var earned = Service.creditsEarned(rs, settings.academic.passMark);
+    var required = settings.academic.requiredCredits;
+    var current = trendClean.length ? trendClean[trendClean.length - 1] : null;
+    var ivals = Service.interventions().filter(function (i) { return i.studentId === st.id; });
+
+    var byPeriod = groupBy(rs, function (r) { return Service.periodKey(r); });
+    var semesterRows = Object.keys(byPeriod).sort().map(function (k) {
+      var list = byPeriod[k];
+      var g = Service.gpa(list);
+      var passed = list.filter(function (r) { return r.score >= settings.academic.passMark; }).length;
+      return [esc(k), g === null ? '—' : g.toFixed(2), sum(list.map(function (r) { return r.creditUnit; })),
+        passed, list.length - passed];
+    });
+
+    var html = '<div class="card"><div class="card-head">' +
+      '<div class="avatar" style="width:52px;height:52px;font-size:1.05rem">' + esc(initials(st.name)) + '</div>' +
+      '<div><h2 style="margin:0">' + esc(st.name) + '</h2>' +
+      '<p class="hint" style="margin:0">' + esc(st.studentId) + ' · ' + esc(st.programme) + ' · ' +
+        esc(st.department) + ' · Level ' + st.level + '</p></div>' +
+      '<div class="spacer"></div>' + UI.statusBadge(st.status) + ' ' + UI.riskBadge(rk.band) +
+      '<button class="btn btn-sm" data-act="record-intervention" data-id="' + st.id + '">Record intervention</button>' +
+      '<button class="btn btn-sm" data-act="export-student" data-id="' + st.id + '">Export CSV</button>' +
+      '</div></div>';
+
+    html += '<div class="grid g-kpi">' +
+      UI.kpi('Current GPA', current === null ? '—' : current.toFixed(2), 'Most recent period', 'info') +
+      UI.kpi('CGPA', Service.gpa(rs) === null ? '—' : Service.gpa(rs).toFixed(2), 'Credit-weighted', 'teal') +
+      UI.kpi('Completed credits', num(earned), 'Passed courses only', 'good') +
+      UI.kpi('Remaining credits', num(Math.max(0, required - earned)), 'Required: ' + required, '') +
+      UI.kpi('Attendance', st.attendance + '%', 'Threshold: ' + settings.academic.attendanceThreshold + '%',
+        st.attendance < settings.academic.attendanceThreshold ? 'warn' : 'good') +
+      UI.kpi('Risk score', rk.score + '/100', rk.band + ' band',
+        rk.band === 'High' || rk.band === 'Critical' ? 'bad' : 'good') +
+    '</div>';
+
+    html += '<div class="grid g-2">' +
+      '<div class="card"><div class="card-head"><h2>Performance trend</h2></div>' +
+        Charts.line({ labels: trendLabels, series: [{ name: 'GPA', values: trendClean }], yMax: 5, title: 'GPA trend' }) + '</div>' +
+      '<div class="card"><div class="card-head"><h2>Academic progression</h2></div>' +
+        Charts.progressList([
+          { label: 'Credits earned', value: (earned / required) * 100, display: round((earned / required) * 100, 1) + '%' },
+          { label: 'Attendance', value: st.attendance, display: st.attendance + '%' },
+          { label: 'CGPA (of 5.00)', value: (Service.gpa(rs) || 0) / 5 * 100, display: (Service.gpa(rs) || 0).toFixed(2) }
+        ], { max: 100, toneFn: function (v) { return v < 50 ? 'bad' : v < 70 ? 'warn' : 'good'; } }) +
+        '<p class="hint">Progress % = Credits earned ÷ Required credits × 100 (' + required + ' required).</p>' +
+      '</div>' +
+    '</div>';
+
+    html += '<div class="card"><div class="card-head"><h2>Risk analysis</h2><span class="tag-demo">MVP rule-based model</span></div>' +
+      '<p>' + UI.riskBadge(rk.band) + ' <strong>' + rk.score + '/100</strong></p>' +
+      '<h3>Main risk factors</h3><ul>' + rk.factors.map(function (f) { return '<li>' + esc(f) + '</li>'; }).join('') + '</ul>' +
+      '<h3>Component breakdown</h3>' +
+      Charts.progressList(Object.keys(rk.parts).map(function (k) {
+        var max = {
+          'GPA shortfall': 30, 'Failure proportion': 25, 'Attendance shortfall': 20,
+          'Declining GPA trend': 15, 'Credit progress': 10
+        }[k];
+        return { label: k + ' (max ' + max + ')', value: rk.parts[k], display: rk.parts[k].toFixed(1) };
+      }), { max: 30, toneFn: function (v) { return v > 15 ? 'bad' : v > 6 ? 'warn' : 'good'; } }) +
+    '</div>';
+
+    html += '<div class="card"><div class="card-head"><h2>Recommended actions</h2><span class="tag-demo">Smart Recommendation</span></div>' +
+      recos.map(function (r) {
+        return '<div class="reco"><div class="r-trigger">' + esc(r.trigger) + '</div>' +
+          '<div class="r-action">' + esc(r.action) + '</div></div>';
+      }).join('') + '</div>';
+
+    html += '<div class="grid g-2">' +
+      '<div class="card"><div class="card-head"><h2>Semester performance</h2></div>' +
+        UI.table([{ label: 'Period' }, { label: 'GPA', num: true }, { label: 'Credits', num: true },
+          { label: 'Passed', num: true }, { label: 'Failed', num: true }], semesterRows) + '</div>' +
+      '<div class="card"><div class="card-head"><h2>Attendance by course</h2></div>' +
+        UI.table([{ label: 'Course' }, { label: 'Attendance', num: true }, { label: 'Status' }],
+          rs.map(function (r) {
+            var c = Service.course(r.courseId);
+            return [esc(c ? c.code + ' — ' + c.title : '—'), r.attendance + '%',
+              r.attendance < settings.academic.attendanceThreshold
+                ? '<span class="badge b-warn">Below threshold</span>'
+                : '<span class="badge b-good">Adequate</span>'];
+          })) + '</div>' +
+    '</div>';
+
+    html += '<div class="card"><div class="card-head"><h2>Course performance</h2></div>' +
+      UI.table(
+        [{ label: 'Code' }, { label: 'Course title' }, { label: 'Units', num: true }, { label: 'Score', num: true },
+         { label: 'Grade' }, { label: 'Grade point', num: true }, { label: 'Attendance', num: true }, { label: 'Status' }],
+        rs.map(function (r) {
+          var c = Service.course(r.courseId);
+          return [esc(c ? c.code : '—'), esc(c ? c.title : '—'), r.creditUnit, r.score, UI.gradeBadge(r.grade),
+            r.gradePoint, r.attendance + '%',
+            r.score >= settings.academic.passMark
+              ? '<span class="badge b-good">Passed</span>'
+              : '<span class="badge b-bad">Failed</span>'];
+        })) + '</div>';
+
+    html += '<div class="card"><div class="card-head"><h2>Intervention history</h2>' +
+      '<div class="spacer"></div><button class="btn btn-sm btn-primary" data-act="record-intervention" data-id="' + st.id + '">Record intervention</button></div>' +
+      (ivals.length
+        ? UI.table(
+            [{ label: 'Risk' }, { label: 'Type' }, { label: 'Adviser' }, { label: 'Date' }, { label: 'Action' },
+             { label: 'Outcome' }, { label: 'Follow-up' }, { label: 'Status' }],
+            ivals.map(function (i) {
+              return [UI.riskBadge(i.riskLevel), esc(i.type), esc(i.adviser), esc(i.date), esc(i.action),
+                esc(i.outcome), esc(i.followUp), UI.statusBadge(i.status)];
+            }))
+        : '<p class="hint">No intervention has been recorded for this student.</p>') +
+      '</div>';
+
+    return { title: st.name, subtitle: st.studentId + ' · Level ' + st.level, html: html };
+  };
+
+  /* ---- courses ------------------------------------------------------- */
+  Pages.courses = function (user) {
+    var courses = Service.visibleCourses(user);
+    var settings = Service.settings();
+    var passMark = settings.academic.passMark;
+    var results = Service.results();
+
+    var rows = courses.map(function (c) {
+      var rs = results.filter(function (r) { return r.courseId === c.id; });
+      var passed = rs.filter(function (r) { return r.score >= passMark; }).length;
+      var failed = rs.length - passed;
+      var lecturer = Service.lecturerOf(c);
+      var failureRate = rs.length ? pct(failed, rs.length) : 0;
+      return [
+        '<a href="#/course/' + c.id + '">' + esc(c.code) + '</a>', esc(c.title), esc(c.department), c.creditUnit,
+        rs.length,
+        rs.length ? round(pct(passed, rs.length), 1) + '%' : '—',
+        rs.length ? round(mean(rs.map(function (r) { return r.score; })), 1) : '—',
+        rs.length ? round(failureRate, 1) + '%' : '—',
+        rs.length ? round(mean(rs.map(function (r) { return r.attendance; })), 1) + '%' : '—',
+        esc(lecturer ? lecturer.name : '—'),
+        failureRate > 30 ? '<span class="badge b-bad">High failure</span>'
+          : failureRate < 10 ? '<span class="badge b-good">Strong</span>'
+          : '<span class="badge b-neutral">Normal</span>'
+      ];
+    });
+
+    var html = '<div class="card"><div class="card-head"><h2>Course catalogue</h2><div class="spacer"></div>' +
+      '<button class="btn btn-sm" data-act="export-courses">Export CSV</button></div>' +
+      UI.table(
+        [{ label: 'Code' }, { label: 'Title' }, { label: 'Department' }, { label: 'Units', num: true },
+         { label: 'Enrolment', num: true }, { label: 'Pass rate', num: true }, { label: 'Avg score', num: true },
+         { label: 'Failure rate', num: true }, { label: 'Attendance', num: true }, { label: 'Lecturer' }, { label: 'Indicator' }],
+        rows) + '</div>';
+    return {
+      title: 'Courses',
+      subtitle: 'Enrolment, pass rate, average score, failure rate and attendance are calculated from the result records.',
+      html: html
+    };
+  };
+
+  Pages.courseDetails = function (user, id) {
+    var c = Service.course(id);
+    if (!c) { return { title: 'Course', subtitle: '', html: UI.error('That course record does not exist.') }; }
+    if (user.role === 'lecturer' && c.lecturerId !== user.id) { return { title: c.code, subtitle: '', html: UI.denied() }; }
+    var settings = Service.settings();
+    var passMark = settings.academic.passMark;
+    var rs = Service.resultsForCourse(c.id);
+    var passed = rs.filter(function (r) { return r.score >= passMark; }).length;
+    var failed = rs.length - passed;
+    var lecturer = Service.lecturerOf(c);
+    var gradeCounts = { A: 0, B: 0, C: 0, D: 0, E: 0, F: 0 };
+    rs.forEach(function (r) { if (gradeCounts[r.grade] !== undefined) { gradeCounts[r.grade]++; } });
+
+    var bySem = groupBy(rs, function (r) { return Service.periodKey(r); });
+    var semLabels = Object.keys(bySem).sort();
+    var semAvg = semLabels.map(function (k) { return round(mean(bySem[k].map(function (r) { return r.score; })), 1); });
+    var semPass = semLabels.map(function (k) {
+      return pct(bySem[k].filter(function (r) { return r.score >= passMark; }).length, bySem[k].length);
+    });
+
+    var html = '<div class="card"><div class="card-head"><h2>' + esc(c.code) + ' — ' + esc(c.title) + '</h2>' +
+      '<div class="spacer"></div><button class="btn btn-sm" data-act="export-course" data-id="' + c.id + '">Export CSV</button></div>' +
+      '<dl class="kv">' +
+        '<dt>Department</dt><dd>' + esc(c.department) + '</dd>' +
+        '<dt>Credit units</dt><dd>' + c.creditUnit + '</dd>' +
+        '<dt>Level</dt><dd>' + c.level + '</dd>' +
+        '<dt>Lecturer</dt><dd>' + esc(lecturer ? lecturer.name : '—') + '</dd>' +
+      '</dl></div>';
+
+    html += '<div class="grid g-kpi">' +
+      UI.kpi('Enrolment', num(rs.length), 'Result records', 'info') +
+      UI.kpi('Average score', rs.length ? round(mean(rs.map(function (r) { return r.score; })), 1) : '—', 'Mean of all records', 'teal') +
+      UI.kpi('Median score', rs.length ? median(rs.map(function (r) { return r.score; })) : '—', 'Middle value', '') +
+      UI.kpi('Pass rate', rs.length ? round(pct(passed, rs.length), 1) + '%' : '—', passed + ' passed', 'good') +
+      UI.kpi('Failure rate', rs.length ? round(pct(failed, rs.length), 1) + '%' : '—', failed + ' failed', failed > 0 ? 'warn' : 'good') +
+      UI.kpi('Average attendance', rs.length ? round(mean(rs.map(function (r) { return r.attendance; })), 1) + '%' : '—',
+        'Threshold ' + settings.academic.attendanceThreshold + '%', '') +
+    '</div>';
+
+    html += '<div class="grid g-2">' +
+      '<div class="card"><div class="card-head"><h2>Grade distribution</h2></div>' +
+        Charts.donut({
+          segments: Object.keys(gradeCounts).map(function (g) { return { label: g, value: gradeCounts[g] }; }),
+          unit: 'results'
+        }) + '</div>' +
+      '<div class="card"><div class="card-head"><h2>Semester comparison — average score</h2></div>' +
+        Charts.bar({ labels: semLabels, values: semAvg, yMax: 100 }) + '</div>' +
+      '<div class="card"><div class="card-head"><h2>Semester comparison — pass rate %</h2></div>' +
+        Charts.bar({ labels: semLabels, values: semPass, yMax: 100 }) + '</div>' +
+      '<div class="card"><div class="card-head"><h2>Assessment breakdown</h2></div>' +
+        (function () {
+          var ca = rs.length ? round(mean(rs.map(function (r) { return r.assessmentScore; })), 1) : 0;
+          var ex = rs.length ? round(mean(rs.map(function (r) { return r.examScore; })), 1) : 0;
+          return Charts.bar({
+            labels: ['Continuous assessment (max 40)', 'Examination (max 60)'],
+            values: [ca, ex], yMax: 60, colors: ['#2563eb', '#0f766e']
+          }) +
+            '<p class="hint">' + (ca < ex * 0.6
+              ? 'Students are comparatively weaker in continuous assessment for this course.'
+              : ex < ca * 1.2
+                ? 'Students are comparatively weaker in the examination component for this course.'
+                : 'Continuous assessment and examination performance are broadly balanced.') + '</p>';
+        })() + '</div>' +
+    '</div>';
+
+    var sorted = rs.slice().sort(function (a, b) { return b.score - a.score; });
+    html += '<div class="card"><div class="card-head"><h2>Student performance distribution</h2></div>' +
+      UI.table([{ label: 'Student' }, { label: 'Student ID' }, { label: 'Score', num: true }, { label: 'Grade' },
+        { label: 'Attendance', num: true }, { label: 'Status' }],
+        sorted.map(function (r) {
+          var s = Service.student(r.studentId);
+          return ['<a href="#/student/' + r.studentId + '">' + esc(s ? s.name : '—') + '</a>',
+            esc(s ? s.studentId : '—'), r.score, UI.gradeBadge(r.grade), r.attendance + '%',
+            r.score >= passMark ? '<span class="badge b-good">Passed</span>' : '<span class="badge b-bad">Failed</span>'];
+        })) + '</div>';
+
+    return { title: c.code, subtitle: c.title, html: html };
+  };
+
+  /* ---- departments / faculties --------------------------------------- */
+  Pages.departments = function (user) {
+    var ctx = Service.context(user, State.filters);
+    var passMark = ctx.passMark;
+    var groups = groupBy(ctx.results, function (r) {
+      var s = byId(ctx.students, r.studentId);
+      return s ? s.department : 'Unknown';
+    });
+    var labels = Object.keys(groups).sort();
+    var rows = labels.map(function (d) {
+      var list = groups[d];
+      var ids = {};
+      list.forEach(function (r) { ids[r.studentId] = 1; });
+      var students = Object.keys(ids).map(function (id) { return byId(ctx.students, id); }).filter(Boolean);
+      var gpas = students.map(function (s) { return Service.cgpa(s.id); }).filter(function (v) { return v !== null; });
+      var atRisk = students.filter(function (s) {
+        var band = Service.risk(s, Service.resultsFor(s.id)).band;
+        return band === 'High' || band === 'Critical';
+      }).length;
+      var active = students.filter(function (s) { return s.status === 'active'; }).length;
+      return {
+        name: d,
+        students: students.length,
+        programmes: Service.programmes().filter(function (p) { return p.department === d; }).length,
+        gpa: gpas.length ? round(mean(gpas), 2) : null,
+        pass: pct(list.filter(function (r) { return r.score >= passMark; }).length, list.length),
+        fail: pct(list.filter(function (r) { return r.score < passMark; }).length, list.length),
+        atRisk: atRisk,
+        retention: students.length ? pct(active, students.length) : null
+      };
+    });
+
+    var html = '<div class="card"><div class="card-head"><h2>Department comparison</h2><div class="spacer"></div>' +
+      '<button class="btn btn-sm" data-act="export-departments">Export CSV</button></div>' +
+      UI.table(
+        [{ label: 'Department' }, { label: 'Students', num: true }, { label: 'Programmes', num: true },
+         { label: 'Average GPA', num: true }, { label: 'Pass rate', num: true }, { label: 'Failure rate', num: true },
+         { label: 'At-risk', num: true }, { label: 'Retention', num: true }],
+        rows.map(function (r) {
+          return [esc(r.name), r.students, r.programmes, r.gpa === null ? '—' : r.gpa.toFixed(2),
+            r.pass + '%', r.fail + '%', r.atRisk, r.retention === null ? '—' : r.retention + '%'];
+        })) + '</div>';
+
+    html += '<div class="grid g-2">' +
+      '<div class="card"><div class="card-head"><h2>Average GPA by department</h2></div>' +
+        Charts.bar({ labels: labels, values: rows.map(function (r) { return r.gpa || 0; }), yMax: 5 }) + '</div>' +
+      '<div class="card"><div class="card-head"><h2>At-risk students by department</h2></div>' +
+        Charts.bar({
+          labels: labels, values: rows.map(function (r) { return r.atRisk; }),
+          yMax: Math.max(5, Math.max.apply(null, rows.map(function (r) { return r.atRisk; })))
+        }) + '</div>' +
+    '</div>';
+
+    var atRiskStudents = ctx.enriched.filter(function (e) { return e.risk.band === 'High' || e.risk.band === 'Critical'; });
+    html += '<div class="card"><div class="card-head"><h2>Departmental at-risk detail</h2></div>' +
+      UI.table([{ label: 'Student' }, { label: 'Department' }, { label: 'Level', num: true }, { label: 'CGPA', num: true },
+        { label: 'Attendance', num: true }, { label: 'Risk score', num: true }, { label: 'Band' }],
+        atRiskStudents.slice(0, 25).map(function (e) {
+          return ['<a href="#/student/' + e.student.id + '">' + esc(e.student.name) + '</a>', esc(e.student.department),
+            e.student.level, e.cgpa === null ? '—' : e.cgpa.toFixed(2), e.student.attendance + '%',
+            e.risk.score, UI.riskBadge(e.risk.band)];
+        })) + '</div>';
+
+    return {
+      title: 'Departments',
+      subtitle: 'Comparison of departments within your authorised scope. Presented as analytical indicators, not as labels of individuals.',
+      html: html
+    };
+  };
+
+  Pages.faculty = function (user) {
+    var ctx = Service.context(user, State.filters);
+    var passMark = ctx.passMark;
+    var groups = groupBy(ctx.enriched, function (e) { return e.student.faculty; });
+    var labels = Object.keys(groups).sort();
+    var rows = labels.map(function (f) {
+      var list = groups[f];
+      var students = list.map(function (e) { return e.student; });
+      var results = [];
+      list.forEach(function (e) { results = results.concat(e.results); });
+      var gpas = list.map(function (e) { return e.cgpa; }).filter(function (v) { return v !== null; });
+      var active = students.filter(function (s) { return s.status === 'active'; }).length;
+      var finalYear = list.filter(function (e) { return e.student.level === 400; });
+      var ready = finalYear.filter(function (e) {
+        return Service.creditsEarned(e.allResults, passMark) >= ctx.settings.academic.requiredCredits * 0.5;
+      }).length;
+      return {
+        name: f,
+        departments: Service.departments().filter(function (d) { return d.faculty === f; }).length,
+        students: students.length,
+        gpa: gpas.length ? round(mean(gpas), 2) : null,
+        pass: pct(results.filter(function (r) { return r.score >= passMark; }).length, results.length),
+        fail: pct(results.filter(function (r) { return r.score < passMark; }).length, results.length),
+        atRisk: list.filter(function (e) { return e.risk.band === 'High' || e.risk.band === 'Critical'; }).length,
+        retention: students.length ? pct(active, students.length) : null,
+        graduation: finalYear.length ? pct(ready, finalYear.length) : null
+      };
+    });
+
+    var ranked = rows.slice().sort(function (a, b) { return (b.gpa || 0) - (a.gpa || 0); });
+
+    var html = '<div class="card"><div class="card-head"><h2>Faculty comparison</h2><div class="spacer"></div>' +
+      '<button class="btn btn-sm" data-act="export-faculty">Export CSV</button></div>' +
+      UI.table(
+        [{ label: 'Faculty' }, { label: 'Departments', num: true }, { label: 'Students', num: true },
+         { label: 'Average GPA', num: true }, { label: 'Pass rate', num: true }, { label: 'Failure rate', num: true },
+         { label: 'At-risk', num: true }, { label: 'Retention', num: true }, { label: 'Graduation', num: true }],
+        rows.map(function (r) {
+          return [esc(r.name), r.departments, r.students, r.gpa === null ? '—' : r.gpa.toFixed(2),
+            r.pass + '%', r.fail + '%', r.atRisk,
+            r.retention === null ? '—' : r.retention + '%', r.graduation === null ? '—' : r.graduation + '%'];
+        })) + '</div>';
+
+    html += '<div class="grid g-2">' +
+      '<div class="card"><div class="card-head"><h2>Top performing faculties</h2></div>' +
+        '<p class="hint">Analytical indicator only — this is not a judgement about individuals.</p>' +
+        Charts.progressList(ranked.slice(0, 3).map(function (r) {
+          return { label: r.name, value: (r.gpa || 0) / 5 * 100, display: (r.gpa || 0).toFixed(2) };
+        }), { max: 100, toneFn: function () { return 'good'; } }) + '</div>' +
+      '<div class="card"><div class="card-head"><h2>Faculties requiring attention</h2></div>' +
+        '<p class="hint">Lowest average GPA, presented as an analytical indicator.</p>' +
+        Charts.progressList(ranked.slice(-3).reverse().map(function (r) {
+          return { label: r.name, value: (r.gpa || 0) / 5 * 100, display: (r.gpa || 0).toFixed(2) };
+        }), { max: 100, toneFn: function (v) { return v < 55 ? 'bad' : 'warn'; } }) + '</div>' +
+      '<div class="card"><div class="card-head"><h2>Average GPA by faculty</h2></div>' +
+        Charts.bar({ labels: labels, values: rows.map(function (r) { return r.gpa || 0; }), yMax: 5 }) + '</div>' +
+      '<div class="card"><div class="card-head"><h2>Failure rate by faculty</h2></div>' +
+        Charts.bar({ labels: labels, values: rows.map(function (r) { return r.fail; }), yMax: 100 }) + '</div>' +
+    '</div>';
+
+    return {
+      title: 'Faculty Analytics',
+      subtitle: 'Faculty-level performance, retention and graduation indicators calculated from stored records.',
+      html: html
+    };
+  };
+
+  /* ---- cohorts ------------------------------------------------------- */
+  Pages.cohorts = function (user) {
+    var ctx = Service.context(user, State.filters);
+    var passMark = ctx.passMark;
+    var groups = groupBy(ctx.enriched, function (e) { return String(e.student.level); });
+    var labels = Object.keys(groups).sort();
+    var rows = labels.map(function (l) {
+      var list = groups[l];
+      var results = [];
+      list.forEach(function (e) { results = results.concat(e.results); });
+      var gpas = list.map(function (e) { return e.cgpa; }).filter(function (v) { return v !== null; });
+      var active = list.filter(function (e) { return e.student.status === 'active'; }).length;
+      return {
+        level: 'Level ' + l,
+        students: list.length,
+        gpa: gpas.length ? round(mean(gpas), 2) : null,
+        pass: pct(results.filter(function (r) { return r.score >= passMark; }).length, results.length),
+        fail: pct(results.filter(function (r) { return r.score < passMark; }).length, results.length),
+        attendance: results.length ? round(mean(results.map(function (r) { return r.attendance; })), 1) : null,
+        atRisk: list.filter(function (e) { return e.risk.band === 'High' || e.risk.band === 'Critical'; }).length,
+        retention: list.length ? pct(active, list.length) : null
+      };
+    });
+
+    var bySession = groupBy(ctx.results, function (r) { return r.session; });
+    var sesLabels = Object.keys(bySession).sort();
+    var sesGpa = sesLabels.map(function (k) { return Service.gpa(bySession[k]); });
+
+    var byProgramme = groupBy(ctx.enriched, function (e) { return e.student.programme; });
+    var progLabels = Object.keys(byProgramme).sort();
+    var progGpa = progLabels.map(function (p) {
+      var gpas = byProgramme[p].map(function (e) { return e.cgpa; }).filter(function (v) { return v !== null; });
+      return gpas.length ? round(mean(gpas), 2) : 0;
+    });
+
+    var html = '<div class="card"><div class="card-head"><h2>Cohort comparison by level</h2><div class="spacer"></div>' +
+      '<button class="btn btn-sm" data-act="export-cohorts">Export CSV</button></div>' +
+      UI.table(
+        [{ label: 'Cohort' }, { label: 'Students', num: true }, { label: 'Average GPA', num: true },
+         { label: 'Pass rate', num: true }, { label: 'Failure rate', num: true }, { label: 'Attendance', num: true },
+         { label: 'At-risk', num: true }, { label: 'Retention', num: true }],
+        rows.map(function (r) {
+          return [esc(r.level), r.students, r.gpa === null ? '—' : r.gpa.toFixed(2), r.pass + '%', r.fail + '%',
+            r.attendance === null ? '—' : r.attendance + '%', r.atRisk,
+            r.retention === null ? '—' : r.retention + '%'];
+        })) + '</div>';
+
+    html += '<div class="grid g-2">' +
+      '<div class="card"><div class="card-head"><h2>Average GPA by cohort</h2></div>' +
+        Charts.bar({
+          labels: labels.map(function (l) { return 'Level ' + l; }),
+          values: rows.map(function (r) { return r.gpa || 0; }), yMax: 5
+        }) + '</div>' +
+      '<div class="card"><div class="card-head"><h2>Average GPA by academic session</h2></div>' +
+        Charts.line({
+          labels: sesLabels,
+          series: [{ name: 'Average GPA', values: sesGpa.map(function (v) { return v === null ? 0 : v; }) }],
+          yMax: 5
+        }) + '</div>' +
+      '<div class="card"><div class="card-head"><h2>Average CGPA by programme</h2></div>' +
+        Charts.bar({ labels: progLabels, values: progGpa, yMax: 5 }) + '</div>' +
+      '<div class="card"><div class="card-head"><h2>Cohort at-risk comparison</h2></div>' +
+        Charts.bar({
+          labels: labels.map(function (l) { return 'Level ' + l; }),
+          values: rows.map(function (r) { return r.atRisk; }),
+          yMax: Math.max(5, Math.max.apply(null, rows.map(function (r) { return r.atRisk; })))
+        }) + '</div>' +
+    '</div>';
+
+    return { title: 'Cohort Analytics', subtitle: 'Comparison of cohorts by level, programme and academic session.', html: html };
+  };
+
+  /* ---- analytics ----------------------------------------------------- */
+  Pages.analytics = function (user) {
+    var ctx = Service.context(user, State.filters);
+    var passMark = ctx.passMark;
+    var insights = Service.insights(ctx);
+    var keys = Service.periodsOrdered().map(function (p) { return p.key; });
+
+    var attendanceBuckets = [
+      { label: 'Below 50%', test: function (r) { return r.attendance < 50; } },
+      { label: '50–59%', test: function (r) { return r.attendance >= 50 && r.attendance < 60; } },
+      { label: '60–69%', test: function (r) { return r.attendance >= 60 && r.attendance < 70; } },
+      { label: '70–79%', test: function (r) { return r.attendance >= 70 && r.attendance < 80; } },
+      { label: '80–89%', test: function (r) { return r.attendance >= 80 && r.attendance < 90; } },
+      { label: '90–100%', test: function (r) { return r.attendance >= 90; } }
+    ];
+    var attAvg = attendanceBuckets.map(function (b) {
+      var rs = ctx.results.filter(b.test);
+      return rs.length ? round(mean(rs.map(function (r) { return r.score; })), 1) : 0;
+    });
+
+    var scoreBuckets = [
+      { label: '0–39', test: function (r) { return r.score < 40; } },
+      { label: '40–49', test: function (r) { return r.score >= 40 && r.score < 50; } },
+      { label: '50–59', test: function (r) { return r.score >= 50 && r.score < 60; } },
+      { label: '60–69', test: function (r) { return r.score >= 60 && r.score < 70; } },
+      { label: '70–100', test: function (r) { return r.score >= 70; } }
+    ];
+    var scoreCounts = scoreBuckets.map(function (b) { return ctx.results.filter(b.test).length; });
+
+    var html = '<div class="card"><div class="card-head"><h2>Smart insights</h2><div class="spacer"></div>' +
+      '<span class="tag-demo">Computed from the dataset</span></div>' + UI.insights(insights) + '</div>';
+
+    html += '<div class="grid g-kpi">' +
+      UI.kpi('Records analysed', num(ctx.metrics.resultCount), 'Result records in the selection', 'info') +
+      UI.kpi('Average score', ctx.metrics.averageCourseScore === null ? '—' : ctx.metrics.averageCourseScore, 'Mean assessment score', 'teal') +
+      UI.kpi('Average attendance', ctx.metrics.averageAttendance === null ? '—' : ctx.metrics.averageAttendance + '%',
+        'Threshold ' + ctx.settings.academic.attendanceThreshold + '%', '') +
+      UI.kpi('Failure rate', ctx.metrics.failureRate === null ? '—' : ctx.metrics.failureRate + '%', 'Score below ' + passMark, 'warn') +
+    '</div>';
+
+    html += '<div class="grid g-2">' +
+      '<div class="card"><div class="card-head"><h2>Attendance vs average score</h2></div>' +
+        Charts.bar({ labels: attendanceBuckets.map(function (b) { return b.label; }), values: attAvg, yMax: 100 }) +
+        '<p class="hint">Mean assessment score for each attendance band, calculated from the selected records.</p></div>' +
+      '<div class="card"><div class="card-head"><h2>Score distribution</h2></div>' +
+        Charts.donut({
+          segments: scoreBuckets.map(function (b, i) { return { label: b.label, value: scoreCounts[i] }; }),
+          unit: 'results'
+        }) + '</div>' +
+      '<div class="card"><div class="card-head"><h2>Pass rate by period</h2></div>' +
+        Charts.bar({
+          labels: keys, values: keys.map(function (k) {
+            var rs = ctx.results.filter(function (r) { return Service.periodKey(r) === k; });
+            return rs.length ? pct(rs.filter(function (r) { return r.score >= passMark; }).length, rs.length) : 0;
+          }), yMax: 100
+        }) + '</div>' +
+      '<div class="card"><div class="card-head"><h2>Assessment component comparison</h2></div>' +
+        (function () {
+          var ca = ctx.results.length ? round(mean(ctx.results.map(function (r) { return r.assessmentScore; })), 1) : 0;
+          var ex = ctx.results.length ? round(mean(ctx.results.map(function (r) { return r.examScore; })), 1) : 0;
+          return Charts.bar({
+            labels: ['Continuous assessment', 'Examination'],
+            values: [ca, ex], yMax: 60, colors: ['#2563eb', '#0f766e']
+          }) + '<p class="hint">Mean continuous-assessment score and mean examination score across the selected records.</p>';
+        })() + '</div>' +
+    '</div>';
+
+    /* progression and graduation */
+    var finalYear = ctx.enriched.filter(function (e) { return e.student.level === 400; });
+    var gradRows = finalYear.map(function (e) {
+      var earned = Service.creditsEarned(e.allResults, passMark);
+      var required = ctx.settings.academic.requiredCredits;
+      var progress = required ? round((earned / required) * 100, 1) : 0;
+      var status = progress >= 50 ? 'Ready' : progress >= 35 ? 'On Track' : progress >= 20 ? 'Needs Attention' : 'At Risk';
+      return { student: e.student, earned: earned, required: required, progress: progress, status: status };
+    });
+
+    html += '<div class="card"><div class="card-head"><h2>Academic progression and graduation readiness</h2>' +
+      '<div class="spacer"></div><button class="btn btn-sm" data-act="export-progression">Export CSV</button></div>' +
+      '<p class="hint">Progress % = Credits earned ÷ Required credits × 100. The readiness threshold applied here is half of the configured graduation requirement (' +
+        ctx.settings.academic.requiredCredits + ' credits), stated explicitly rather than implied.</p>' +
+      UI.table([{ label: 'Student' }, { label: 'Level', num: true }, { label: 'Credits earned', num: true },
+        { label: 'Required', num: true }, { label: 'Progress', num: true }, { label: 'Readiness' }],
+        gradRows.map(function (g) {
+          var tone = g.status === 'Ready' ? 'b-good' : g.status === 'On Track' ? 'b-info'
+            : g.status === 'Needs Attention' ? 'b-warn' : 'b-bad';
+          return ['<a href="#/student/' + g.student.id + '">' + esc(g.student.name) + '</a>', g.student.level,
+            g.earned, g.required, g.progress + '%', '<span class="badge ' + tone + '">' + g.status + '</span>'];
+        })) + '</div>';
+
+    return {
+      title: 'Analytics',
+      subtitle: 'Attendance, assessment, progression and graduation analytics calculated from stored records.',
+      html: html
+    };
+  };
+
+  /* ---- at-risk ------------------------------------------------------- */
+  Pages.atRisk = function (user) {
+    var ctx = Service.context(user, State.filters);
+    var list = ctx.enriched.slice().sort(function (a, b) { return b.risk.score - a.risk.score; });
+    var high = list.filter(function (e) { return e.risk.band === 'High' || e.risk.band === 'Critical'; });
+    var bands = { Low: 0, Moderate: 0, High: 0, Critical: 0 };
+    list.forEach(function (e) { bands[e.risk.band]++; });
+
+    var html = '<div class="note warn"><strong>MVP rule-based risk model — not a validated predictive model.</strong> ' +
+      'The score is a transparent weighted sum: GPA shortfall (30), failure proportion (25), attendance shortfall (20), ' +
+      'declining GPA trend (15) and credit-progress shortfall (10), normalised to 0–100. Bands: 0–24 Low, 25–49 Moderate, ' +
+      '50–74 High, 75–100 Critical. Do not use these bands for high-consequence decisions before validation against real outcomes.</div>';
+
+    html += '<div class="grid g-kpi">' +
+      UI.kpi('Assessed students', num(list.length), 'Within your authorised scope', 'info') +
+      UI.kpi('Low', num(bands.Low), 'Score 0–24', 'good') +
+      UI.kpi('Moderate', num(bands.Moderate), 'Score 25–49', 'warn') +
+      UI.kpi('High', num(bands.High), 'Score 50–74', 'warn') +
+      UI.kpi('Critical', num(bands.Critical), 'Score 75–100', 'bad') +
+    '</div>';
+
+    html += '<div class="grid g-2">' +
+      '<div class="card"><div class="card-head"><h2>Risk band distribution</h2></div>' +
+        Charts.donut({
+          segments: [
+            { label: 'Low', value: bands.Low, color: '#15803d' },
+            { label: 'Moderate', value: bands.Moderate, color: '#b45309' },
+            { label: 'High', value: bands.High, color: '#ea580c' },
+            { label: 'Critical', value: bands.Critical, color: '#b91c1c' }
+          ], unit: 'students'
+        }) + '</div>' +
+      '<div class="card"><div class="card-head"><h2>Highest risk scores</h2></div>' +
+        Charts.progressList(list.slice(0, 8).map(function (e) {
+          return { label: e.student.name, value: e.risk.score, display: e.risk.score };
+        }), { max: 100, toneFn: function (v) { return v >= 75 ? 'bad' : v >= 50 ? 'warn' : 'good'; } }) + '</div>' +
+    '</div>';
+
+    html += filterBarHtml();
+
+    html += '<div class="card"><div class="card-head"><h2>At-risk students</h2><div class="spacer"></div>' +
+      '<button class="btn btn-sm" data-act="export-atrisk">Export CSV</button></div>' +
+      UI.table(
+        [{ label: 'Student' }, { label: 'Department' }, { label: 'Level', num: true }, { label: 'CGPA', num: true },
+         { label: 'Attendance', num: true }, { label: 'Failures', num: true }, { label: 'Risk score', num: true },
+         { label: 'Band' }, { label: 'Main factor' }, { label: 'Action' }],
+        list.map(function (e) {
+          return ['<a href="#/student/' + e.student.id + '">' + esc(e.student.name) + '</a>', esc(e.student.department),
+            e.student.level, e.cgpa === null ? '—' : e.cgpa.toFixed(2), e.student.attendance + '%',
+            e.risk.failures, e.risk.score, UI.riskBadge(e.risk.band), esc(e.risk.factors[0]),
+            '<button class="btn btn-sm" data-act="view-student" data-id="' + e.student.id + '">Review</button>'];
+        })) + '</div>';
+
+    html += '<div class="card"><div class="card-head"><h2>Recommendations for flagged students</h2>' +
+      '<span class="tag-demo">Smart Recommendation</span></div>' +
+      (high.length
+        ? high.slice(0, 12).map(function (e) {
+            var recos = Service.recommendations(e.student, e.results);
+            return '<div class="reco"><div class="r-trigger">' + esc(e.student.name) + ' · ' + esc(e.risk.band) +
+              ' · ' + e.risk.score + '/100</div><div class="r-action">' +
+              recos.map(function (r) {
+                return '<div><strong>' + esc(r.trigger) + ':</strong> ' + esc(r.action) + '</div>';
+              }).join('') + '</div></div>';
+          }).join('')
+        : '<p class="hint">No student in the current selection is in the High or Critical band.</p>') +
+      '</div>';
+
+    return {
+      title: 'At-Risk Students',
+      subtitle: 'Early identification based on a transparent, explainable MVP rule-based model.',
+      html: html
+    };
+  };
+
+  /* ---- reports ------------------------------------------------------- */
+  var REPORT_TYPES = ['University Performance Report', 'Faculty Performance Report', 'Department Report',
+    'Course Performance Report', 'Student Performance Report', 'At-Risk Student Report', 'Cohort Report', 'Attendance Report'];
+
+  function buildReport(type, user) {
+    var ctx = Service.context(user, State.filters);
+    var passMark = ctx.passMark;
+    var out = {
+      title: type, generated: new Date().toISOString(), filters: activeFilterList(),
+      columns: [], rows: [], summary: []
+    };
+
+    if (type === 'University Performance Report' || type === 'Faculty Performance Report') {
+      var g = groupBy(ctx.enriched, function (e) { return e.student.faculty; });
+      out.columns = ['Faculty', 'Students', 'Average GPA', 'Pass rate %', 'Failure rate %', 'At-risk', 'Retention %'];
+      out.rows = Object.keys(g).sort().map(function (f) {
+        var list = g[f];
+        var results = [];
+        list.forEach(function (e) { results = results.concat(e.results); });
+        var gpas = list.map(function (e) { return e.cgpa; }).filter(function (v) { return v !== null; });
+        var active = list.filter(function (e) { return e.student.status === 'active'; }).length;
+        return [f, list.length, gpas.length ? round(mean(gpas), 2) : '',
+          pct(results.filter(function (r) { return r.score >= passMark; }).length, results.length),
+          pct(results.filter(function (r) { return r.score < passMark; }).length, results.length),
+          list.filter(function (e) { return e.risk.band === 'High' || e.risk.band === 'Critical'; }).length,
+          list.length ? pct(active, list.length) : 0];
+      });
+      out.summary = [
+        ['Total students', num(ctx.metrics.totalStudents)],
+        ['Average GPA', ctx.metrics.averageGPA === null ? '—' : ctx.metrics.averageGPA.toFixed(2)],
+        ['Pass rate', ctx.metrics.passRate === null ? '—' : ctx.metrics.passRate + '%'],
+        ['At-risk students', num(ctx.metrics.atRiskCount)]
+      ];
+    } else if (type === 'Department Report') {
+      var gd = groupBy(ctx.enriched, function (e) { return e.student.department; });
+      out.columns = ['Department', 'Students', 'Average GPA', 'Pass rate %', 'Failure rate %', 'Average attendance %'];
+      out.rows = Object.keys(gd).sort().map(function (d) {
+        var list = gd[d];
+        var results = [];
+        list.forEach(function (e) { results = results.concat(e.results); });
+        var gpas = list.map(function (e) { return e.cgpa; }).filter(function (v) { return v !== null; });
+        return [d, list.length, gpas.length ? round(mean(gpas), 2) : '',
+          pct(results.filter(function (r) { return r.score >= passMark; }).length, results.length),
+          pct(results.filter(function (r) { return r.score < passMark; }).length, results.length),
+          results.length ? round(mean(results.map(function (r) { return r.attendance; })), 1) : ''];
+      });
+      out.summary = [['Departments', out.rows.length], ['Students', num(ctx.metrics.totalStudents)]];
+    } else if (type === 'Course Performance Report') {
+      out.columns = ['Course code', 'Title', 'Department', 'Units', 'Enrolment', 'Average score',
+        'Median score', 'Pass rate %', 'Failure rate %', 'Attendance %'];
+      out.rows = Service.visibleCourses(user).map(function (c) {
+        var rs = Service.resultsForCourse(c.id);
+        var passed = rs.filter(function (r) { return r.score >= passMark; }).length;
+        return [c.code, c.title, c.department, c.creditUnit, rs.length,
+          rs.length ? round(mean(rs.map(function (r) { return r.score; })), 1) : '',
+          rs.length ? median(rs.map(function (r) { return r.score; })) : '',
+          rs.length ? pct(passed, rs.length) : '',
+          rs.length ? pct(rs.length - passed, rs.length) : '',
+          rs.length ? round(mean(rs.map(function (r) { return r.attendance; })), 1) : ''];
+      });
+      out.summary = [
+        ['Courses', out.rows.length],
+        ['Mean pass rate', ctx.metrics.passRate === null ? '—' : ctx.metrics.passRate + '%']
+      ];
+    } else if (type === 'Student Performance Report') {
+      out.columns = ['Student ID', 'Name', 'Programme', 'Department', 'Level', 'CGPA', 'Attendance %', 'Risk band', 'Status'];
+      out.rows = ctx.enriched.map(function (e) {
+        return [e.student.studentId, e.student.name, e.student.programme, e.student.department, e.student.level,
+          e.cgpa === null ? '' : e.cgpa.toFixed(2), e.student.attendance, e.risk.band, e.student.status];
+      });
+      out.summary = [
+        ['Students', out.rows.length],
+        ['Average GPA', ctx.metrics.averageGPA === null ? '—' : ctx.metrics.averageGPA.toFixed(2)]
+      ];
+    } else if (type === 'At-Risk Student Report') {
+      var ar = ctx.enriched.filter(function (e) { return e.risk.band === 'High' || e.risk.band === 'Critical'; });
+      out.columns = ['Student ID', 'Name', 'Department', 'Level', 'CGPA', 'Attendance %', 'Risk score', 'Band', 'Main factor'];
+      out.rows = ar.map(function (e) {
+        return [e.student.studentId, e.student.name, e.student.department, e.student.level,
+          e.cgpa === null ? '' : e.cgpa.toFixed(2), e.student.attendance, e.risk.score, e.risk.band, e.risk.factors[0]];
+      });
+      out.summary = [['At-risk students', out.rows.length], ['Critical', ctx.metrics.criticalCount]];
+    } else if (type === 'Cohort Report') {
+      var gc = groupBy(ctx.enriched, function (e) { return String(e.student.level); });
+      out.columns = ['Cohort', 'Students', 'Average GPA', 'Pass rate %', 'Failure rate %', 'At-risk', 'Retention %'];
+      out.rows = Object.keys(gc).sort().map(function (l) {
+        var list = gc[l];
+        var results = [];
+        list.forEach(function (e) { results = results.concat(e.results); });
+        var gpas = list.map(function (e) { return e.cgpa; }).filter(function (v) { return v !== null; });
+        var active = list.filter(function (e) { return e.student.status === 'active'; }).length;
+        return ['Level ' + l, list.length, gpas.length ? round(mean(gpas), 2) : '',
+          pct(results.filter(function (r) { return r.score >= passMark; }).length, results.length),
+          pct(results.filter(function (r) { return r.score < passMark; }).length, results.length),
+          list.filter(function (e) { return e.risk.band === 'High' || e.risk.band === 'Critical'; }).length,
+          list.length ? pct(active, list.length) : 0];
+      });
+      out.summary = [['Cohorts', out.rows.length], ['Students', num(ctx.metrics.totalStudents)]];
+    } else {
+      var gd2 = groupBy(ctx.enriched, function (e) { return e.student.department; });
+      out.columns = ['Department', 'Records', 'Average attendance %', 'Below threshold', 'Mean score'];
+      out.rows = Object.keys(gd2).sort().map(function (d) {
+        var results = [];
+        gd2[d].forEach(function (e) { results = results.concat(e.results); });
+        return [d, results.length,
+          results.length ? round(mean(results.map(function (r) { return r.attendance; })), 1) : '',
+          results.filter(function (r) { return r.attendance < ctx.settings.academic.attendanceThreshold; }).length,
+          results.length ? round(mean(results.map(function (r) { return r.score; })), 1) : ''];
+      });
+      out.summary = [
+        ['Average attendance', ctx.metrics.averageAttendance === null ? '—' : ctx.metrics.averageAttendance + '%'],
+        ['Threshold', ctx.settings.academic.attendanceThreshold + '%']
+      ];
+    }
+    return out;
+  }
+
+  Pages.reports = function (user) {
+    var html = '<div class="card"><div class="card-head"><h2>Report builder</h2></div>' +
+      '<div class="filters">' +
+        '<div><label for="rep-type">Report type</label><select id="rep-type" data-act="report-type">' +
+          REPORT_TYPES.map(function (t) {
+            return '<option' + (State.reportType === t ? ' selected' : '') + '>' + esc(t) + '</option>';
+          }).join('') +
+        '</select></div>' +
+        '<div><label>&nbsp;</label><button class="btn btn-primary btn-block" data-act="generate-report">Generate</button></div>' +
+        '<div><label>&nbsp;</label><button class="btn btn-block" data-act="print-report">Print</button></div>' +
+        '<div><label>&nbsp;</label><button class="btn btn-block" data-act="export-report">Export CSV</button></div>' +
+      '</div>' +
+      '<p class="hint">The report uses the filters currently applied in the application. Reporting period: ' +
+        esc(State.filters.session || 'all sessions') + ', ' + esc(State.filters.semester || 'all semesters') + '.</p>' +
+      '</div>';
+
+    html += filterBarHtml();
+
+    var rep = State.reportGenerated;
+    if (!rep) {
+      html += '<div class="card">' + UI.empty(
+        'Choose a report type and select Generate to build the report from the stored records.',
+        'No report generated yet') + '</div>';
+    } else {
+      var settings = Service.settings();
+      html += '<div class="report-sheet" id="report-sheet">' +
+        '<div class="r-head"><h1>' + esc(settings.institution.name) + '</h1>' +
+          '<h2>' + esc(rep.title) + '</h2>' +
+          '<div class="meta-row"><span>Reporting period: ' + esc(State.filters.session || 'All sessions') + ' · ' +
+            esc(State.filters.semester || 'All semesters') + '</span>' +
+          '<span>Generated: ' + esc(fmtDateTime(rep.generated)) + '</span>' +
+          '<span>Institution ID: ' + esc(settings.institutionId) + '</span></div>' +
+          '<div class="meta-row">' + (rep.filters.length
+            ? '<span>Filters: ' + rep.filters.map(function (f) { return esc(f.label + ' = ' + f.value); }).join(' · ') + '</span>'
+            : '<span>Filters: none applied</span>') + '</div>' +
+        '</div>' +
+        '<div class="grid g-kpi">' + rep.summary.map(function (s) { return UI.kpi(s[0], s[1], '', 'info'); }).join('') + '</div>' +
+        UI.table(rep.columns, rep.rows.map(function (r) { return r.map(function (c) { return esc(c); }); })) +
+        '<p class="hint" style="margin-top:12px">All values in this report are calculated from stored academic records at generation time. ' +
+        'The risk band, where shown, is produced by an MVP rule-based model and is not a validated predictive output.</p>' +
+      '</div>';
+    }
+    return { title: 'Reports', subtitle: 'Generate, preview, print and export academic reports.', html: html };
+  };
+
+  /* ---- data import --------------------------------------------------- */
+  Pages.dataImport = function () {
+    var v = State.importValidation;
+    var html = '<div class="card"><div class="card-head"><h2>Upload an academic dataset (CSV)</h2>' +
+      '<div class="spacer"></div><button class="btn btn-sm" data-act="load-sample">Load sample rows</button>' +
+      '<button class="btn btn-sm" data-act="download-template">Download template</button></div>' +
+      '<div class="drop" id="drop-zone" tabindex="0" role="button" aria-label="Choose or drop a CSV file">' +
+        'Click to choose a CSV file, or drag and drop it here.' +
+        '<input type="file" id="csv-file" accept=".csv,text/csv" style="display:none">' +
+      '</div>' +
+      '<div class="field" style="margin-top:12px"><label for="csv-text">Or paste CSV content</label>' +
+      '<textarea id="csv-text" spellcheck="false" placeholder="student_id,student_name,faculty,department,programme,level,session,semester,course_code,course_title,credit_unit,score,grade,attendance,assessment_score,exam_score"></textarea></div>' +
+      '<div class="actions"><button class="btn btn-primary" data-act="validate-import">Validate records</button>' +
+      '<button class="btn" data-act="reset-import">Clear</button></div>' +
+      '<p class="hint">Required columns: ' + Service.requiredColumns.map(function (c) { return esc(c); }).join(', ') + '. ' +
+      'Invalid records are never imported silently — they are listed with their row number and errors.</p>' +
+      '</div>';
+
+    if (v) {
+      if (!v.ok) {
+        html += '<div class="card">' + UI.error(v.error) + '</div>';
+      } else {
+        html += '<div class="grid g-kpi">' +
+          UI.kpi('Total rows', num(v.total), 'Data rows read', 'info') +
+          UI.kpi('Accepted', num(v.accepted.length), 'Ready to import', 'good') +
+          UI.kpi('Rejected', num(v.rejected.length), 'Not imported', v.rejected.length ? 'bad' : 'good') +
+          UI.kpi('Duplicates', num(v.duplicates), 'Composite key clash', 'warn') +
+          UI.kpi('Missing values', num(v.missingValues), 'Required field absent', 'warn') +
+          UI.kpi('Invalid records', num(v.invalidRecords), 'Range or format breach', 'warn') +
+        '</div>';
+
+        if (v.missingColumns.length) {
+          html += '<div class="note bad">Missing required columns: ' +
+            v.missingColumns.map(function (c) { return esc(c); }).join(', ') + '</div>';
+        }
+
+        html += '<div class="card"><div class="card-head"><h2>Accepted records preview</h2></div>' +
+          UI.table(['Line', 'student_id', 'course_code', 'session', 'semester', 'score', 'grade', 'credit_unit'],
+            v.accepted.slice(0, 30).map(function (a) {
+              var r = a.record;
+              return [a.line, esc(r.student_id), esc(r.course_code), esc(r.session), esc(r.semester),
+                esc(r.score), esc(r.grade), esc(r.credit_unit)];
+            }),
+            { emptyMessage: 'No record in this file passed validation.' }) + '</div>';
+
+        if (v.rejected.length) {
+          html += '<div class="card"><div class="card-head"><h2>Validation report — rejected records</h2></div>' +
+            UI.table(['Line', 'Errors', 'Raw record'],
+              v.rejected.slice(0, 60).map(function (r) {
+                return [r.line, esc(r.errors.join('; ')), esc(r.raw.join(','))];
+              })) + '</div>';
+        }
+
+        html += '<div class="card"><div class="card-head"><h2>Confirm import</h2></div>' +
+          '<p>' + num(v.accepted.length) + ' record(s) will be stored. ' + num(v.rejected.length) +
+            ' record(s) will be excluded and will not be written.</p>' +
+          '<div class="actions"><button class="btn btn-primary" data-act="commit-import"' +
+            (v.accepted.length ? '' : ' disabled') + '>Confirm import</button>' +
+          '<button class="btn" data-act="reset-import">Cancel</button></div></div>';
+      }
+    }
+
+    var logs = Service.auditLogs().filter(function (l) { return l.action === 'Data imported'; }).slice(0, 8);
+    html += '<div class="card"><div class="card-head"><h2>Recent imports</h2></div>' +
+      UI.table(['Date', 'User', 'Description'],
+        logs.map(function (l) { return [esc(fmtDateTime(l.date)), esc(l.user), esc(l.description)]; }),
+        { emptyMessage: 'No import has been performed in this session.' }) + '</div>';
+
+    return {
+      title: 'Data Import',
+      subtitle: 'Validate before you commit — invalid records are reported, never imported silently.',
+      html: html
+    };
+  };
+
+  /* ---- notifications and alerts -------------------------------------- */
+  Pages.notifications = function () {
+    var list = Service.notifications();
+    var html = '<div class="card"><div class="card-head"><h2>Notifications</h2><div class="spacer"></div>' +
+      '<button class="btn btn-sm" data-act="read-all-notifications">Mark all as read</button></div>' +
+      (list.length
+        ? list.map(function (n) {
+            return '<div class="insight' + (n.read ? '' : ' warn') + '"><span class="dot"></span><span>' +
+              '<strong>' + esc(n.title) + '</strong> <span class="badge b-neutral">' + esc(n.type) + '</span><br>' +
+              esc(n.body) + '<br><span class="hint">' + esc(fmtDateTime(n.date)) + (n.read ? '' : ' · unread') + '</span>' +
+              '<br><span style="display:inline-flex;gap:6px;margin-top:6px">' +
+              (n.target ? '<a class="btn btn-sm" href="' + esc(n.target) + '">Open</a>' : '') +
+              (n.read ? '' : '<button class="btn btn-sm" data-act="read-notification" data-id="' + n.id + '">Mark as read</button>') +
+              '<button class="btn btn-sm" data-act="delete-notification" data-id="' + n.id + '">Delete</button></span>' +
+            '</span></div>';
+          }).join('')
+        : UI.empty('No notifications are available.')) + '</div>';
+    return { title: 'Notifications', subtitle: 'Persisted in application storage.', html: html };
+  };
+
+  Pages.alerts = function () {
+    var alerts = Service.alerts();
+    var html = '<div class="card"><div class="card-head"><h2>Alert centre</h2><div class="spacer"></div>' +
+      '<button class="btn btn-sm" data-act="regenerate-alerts">Recalculate alerts</button>' +
+      '<button class="btn btn-sm" data-act="read-all-alerts">Mark all as read</button></div>' +
+      '<p class="hint">Alerts are derived from the current dataset, not authored. Recalculating replaces them entirely.</p>' +
+      (alerts.length
+        ? alerts.map(function (a) {
+            return '<div class="insight ' + (a.severity === 'Critical' ? 'bad' : 'warn') + '"><span class="dot"></span><span>' +
+              '<strong>' + esc(a.title) + '</strong> <span class="badge ' +
+                (a.severity === 'Critical' ? 'b-crit' : 'b-high') + '">' + esc(a.severity) + '</span>' +
+              ' <span class="badge b-neutral">' + esc(a.type) + '</span><br>' + esc(a.detail) +
+              '<br><span class="hint">' + esc(fmtDateTime(a.date)) + '</span>' +
+              '<br><span style="display:inline-flex;gap:6px;margin-top:6px">' +
+              (a.target ? '<a class="btn btn-sm" href="' + esc(a.target) + '">Open</a>' : '') +
+              '<button class="btn btn-sm" data-act="read-alert" data-id="' + a.id + '">Mark as read</button></span>' +
+            '</span></div>';
+          }).join('')
+        : UI.empty('No alerts are active. Select Recalculate alerts to derive them from the current dataset.')) +
+      '</div>';
+    return { title: 'Alert Centre', subtitle: 'Calculated thresholds, not authored messages.', html: html };
+  };
+
+  /* ---- interventions -------------------------------------------------- */
+  Pages.interventions = function (user) {
+    var list = Service.interventions().slice().sort(function (a, b) { return a.date < b.date ? 1 : -1; });
+    var byStatus = groupBy(list, function (i) { return i.status; });
+    var html = '<div class="grid g-kpi">' +
+      UI.kpi('Interventions', num(list.length), 'All recorded interventions', 'info') +
+      UI.kpi('Open', num((byStatus.Open || []).length), 'Awaiting action', 'warn') +
+      UI.kpi('In progress', num((byStatus['In Progress'] || []).length), 'Under way', 'info') +
+      UI.kpi('Completed', num((byStatus.Completed || []).length), 'Closed', 'good') +
+      UI.kpi('Follow-up required', num((byStatus['Follow-up Required'] || []).length), 'Needs attention', 'warn') +
+    '</div>';
+
+    html += '<div class="card"><div class="card-head"><h2>Intervention log</h2><div class="spacer"></div>' +
+      '<button class="btn btn-sm" data-act="export-interventions">Export CSV</button></div>' +
+      UI.table(
+        [{ label: 'Student' }, { label: 'Risk at time' }, { label: 'Issue' }, { label: 'Type' }, { label: 'Adviser' },
+         { label: 'Date' }, { label: 'Action' }, { label: 'Outcome' }, { label: 'Follow-up' }, { label: 'Status' }],
+        list.map(function (i) {
+          var s = Service.student(i.studentId);
+          return ['<a href="#/student/' + i.studentId + '">' + esc(s ? s.name : '—') + '</a>', UI.riskBadge(i.riskLevel),
+            esc(i.issue), esc(i.type), esc(i.adviser), esc(i.date), esc(i.action), esc(i.outcome), esc(i.followUp), UI.statusBadge(i.status)];
+        }),
+        { emptyMessage: 'No intervention has been recorded yet.' }) + '</div>';
+
+    return {
+      title: 'Interventions',
+      subtitle: 'A recommendation that cannot be assigned, tracked and closed is an observation; this is the record that makes it an intervention.',
+      html: html
+    };
+  };
+
+  /* ---- audit log ------------------------------------------------------ */
+  Pages.audit = function () {
+    var logs = Service.auditLogs();
+    var html = '<div class="card"><div class="card-head"><h2>Audit log</h2><div class="spacer"></div>' +
+      '<button class="btn btn-sm" data-act="export-audit">Export CSV</button></div>' +
+      '<p class="hint">Records user login, data imported, report generated, student record viewed, settings changed, user created, user role changed and data exported. Capped at 300 entries, newest first.</p>' +
+      UI.table([{ label: 'Date/time' }, { label: 'Action' }, { label: 'User' }, { label: 'Role' }, { label: 'Target' }, { label: 'Description' }],
+        logs.map(function (l) {
+          return [esc(fmtDateTime(l.date)), esc(l.action), esc(l.user),
+            esc(ROLE_LABEL[l.role] || l.role), esc(l.target), esc(l.description)];
+        })) + '</div>';
+    return { title: 'Audit Log', subtitle: 'Append-only trail of administrative and data events.', html: html };
+  };
+
+  /* ---- users (super admin) -------------------------------------------- */
+  Pages.users = function () {
+    var users = Service.users();
+    var byRole = groupBy(users, function (u) { return u.role; });
+    var html = '<div class="grid g-kpi">' + ALL_ROLES.map(function (r) {
+      return UI.kpi(ROLE_LABEL[r] + 's', num((byRole[r] || []).length), 'Accounts', 'info');
+    }).join('') + '</div>';
+
+    html += '<div class="card"><div class="card-head"><h2>User accounts</h2><div class="spacer"></div>' +
+      '<button class="btn btn-sm" data-act="export-users">Export CSV</button></div>' +
+      UI.table(
+        [{ label: 'Name' }, { label: 'Email' }, { label: 'Role' }, { label: 'Faculty' }, { label: 'Department' },
+         { label: 'Last login' }, { label: 'Status' }, { label: 'Actions' }],
+        users.map(function (u) {
+          return [esc(u.name), esc(u.email), esc(ROLE_LABEL[u.role] || u.role), esc(u.faculty || '—'),
+            esc(u.department || '—'), esc(u.lastLogin ? fmtDateTime(u.lastLogin) : 'Never'),
+            UI.statusBadge(u.status),
+            '<span style="display:inline-flex;gap:4px">' +
+            '<button class="btn btn-sm" data-act="edit-user" data-id="' + u.id + '">Edit role</button>' +
+            '<button class="btn btn-sm" data-act="toggle-user" data-id="' + u.id + '">' +
+              (u.status === 'active' ? 'Suspend' : 'Activate') + '</button></span>'];
+        })) + '</div>';
+    return { title: 'User Management', subtitle: 'Activate, suspend and change the role of any account.', html: html };
+  };
+
+  /* ---- academic structure --------------------------------------------- */
+  Pages.structure = function () {
+    var faculties = Service.faculties();
+    var departments = Service.departments();
+    var courses = Service.courses();
+
+    var html = '<div class="card"><div class="card-head"><h2>Faculties</h2><div class="spacer"></div>' +
+      '<button class="btn btn-sm btn-primary" data-act="add-faculty">Add faculty</button></div>' +
+      UI.table(['Name', 'Departments', 'Students', 'Actions'],
+        faculties.map(function (f) {
+          var deps = departments.filter(function (d) { return d.faculty === f.name; }).length;
+          var studs = Service.students().filter(function (s) { return s.faculty === f.name; }).length;
+          return [esc(f.name), deps, studs,
+            '<button class="btn btn-sm" data-act="delete-faculty" data-id="' + f.id + '">Delete</button>'];
+        })) + '</div>';
+
+    html += '<div class="card"><div class="card-head"><h2>Departments</h2><div class="spacer"></div>' +
+      '<button class="btn btn-sm btn-primary" data-act="add-department">Add department</button></div>' +
+      UI.table(['Name', 'Faculty', 'Programmes', 'Courses', 'Students'],
+        departments.map(function (d) {
+          var progs = Service.programmes().filter(function (p) { return p.department === d.name; }).length;
+          var crs = courses.filter(function (c) { return c.department === d.name; }).length;
+          var studs = Service.students().filter(function (s) { return s.department === d.name; }).length;
+          return [esc(d.name), esc(d.faculty), progs, crs, studs];
+        })) + '</div>';
+
+    html += '<div class="card"><div class="card-head"><h2>Programmes</h2></div>' +
+      UI.table(['Programme', 'Department', 'Faculty', 'Students'],
+        Service.programmes().map(function (p) {
+          var studs = Service.students().filter(function (s) { return s.programme === p.name; }).length;
+          return [esc(p.name), esc(p.department), esc(p.faculty), studs];
+        })) + '</div>';
+
+    html += '<div class="card"><div class="card-head"><h2>Courses</h2><div class="spacer"></div>' +
+      '<button class="btn btn-sm btn-primary" data-act="add-course">Add course</button></div>' +
+      UI.table(['Code', 'Title', 'Department', 'Units', 'Level', 'Actions'],
+        courses.map(function (c) {
+          return [esc(c.code), esc(c.title), esc(c.department), c.creditUnit, c.level,
+            '<button class="btn btn-sm" data-act="delete-course" data-id="' + c.id + '">Delete</button>'];
+        })) + '</div>';
+
+    return {
+      title: 'Academic Structure',
+      subtitle: 'Faculties, departments, programmes and courses stored in application storage.',
+      html: html
+    };
+  };
+
+  /* ---- semesters ------------------------------------------------------- */
+  Pages.semesters = function () {
+    var list = Service.semesters();
+    var html = '<div class="card"><div class="card-head"><h2>Academic sessions and semesters</h2><div class="spacer"></div>' +
+      '<button class="btn btn-sm btn-primary" data-act="add-semester">Add period</button></div>' +
+      UI.table(['Session', 'Semester', 'Start', 'End', 'Status', 'Records', 'Actions'],
+        list.map(function (s) {
+          var count = Service.results().filter(function (r) {
+            return r.session === s.session && r.semester === s.semester;
+          }).length;
+          return [esc(s.session), esc(s.semester), esc(s.startDate), esc(s.endDate), UI.statusBadge(s.status), count,
+            '<button class="btn btn-sm" data-act="delete-semester" data-id="' + s.id + '">Delete</button>'];
+        })) + '</div>';
+    return { title: 'Semesters', subtitle: 'Academic periods used by the filters and the trend analysis.', html: html };
+  };
+
+  /* ---- data management ------------------------------------------------- */
+  Pages.dataManagement = function () {
+    var keys = Store.keys().filter(function (k) { return k.indexOf('sc_') === 0; }).sort();
+    var html = '<div class="grid g-kpi">' +
+      UI.kpi('Students', num(Service.students().length), 'Stored records', 'info') +
+      UI.kpi('Courses', num(Service.courses().length), 'Stored records', 'info') +
+      UI.kpi('Results', num(Service.results().length), 'Stored records', 'info') +
+      UI.kpi('Users', num(Service.users().length), 'Stored records', 'info') +
+    '</div>';
+
+    html += '<div class="card"><div class="card-head"><h2>Storage keys</h2><div class="spacer"></div>' +
+      '<button class="btn btn-sm btn-danger" data-act="reset-data">Reset demonstration dataset</button></div>' +
+      '<p class="hint">Backing store: ' +
+        (Store.isAvailable() ? 'LocalStorage (available)' : 'in-memory fallback (LocalStorage unavailable)') + '</p>' +
+      UI.table(['Key', 'Entries'],
+        keys.map(function (k) {
+          var v = Store.get(k, null);
+          var size = Array.isArray(v) ? v.length : (v === null ? 0 : 1);
+          return [esc(k), size];
+        })) + '</div>';
+
+    html += '<div class="card"><div class="card-head"><h2>Export the full dataset</h2></div>' +
+      '<div class="actions">' +
+        '<button class="btn" data-act="export-all-students">Students CSV</button>' +
+        '<button class="btn" data-act="export-all-results">Results CSV</button>' +
+        '<button class="btn" data-act="export-all-courses">Courses CSV</button>' +
+        '<button class="btn" data-act="export-all-audit">Audit log CSV</button>' +
+      '</div></div>';
+
+    return {
+      title: 'Data Management',
+      subtitle: 'Inspect storage, export the dataset and reset the demonstration data.',
+      html: html
+    };
+  };
+
+  /* ---- settings -------------------------------------------------------- */
+  Pages.settings = function (user) {
+    var s = Service.settings();
+    var canEdit = user.role === 'super_admin' || user.role === 'university_admin';
+
+    var html = '<div class="card"><div class="card-head"><h2>Appearance and notifications</h2></div>' +
+      '<div class="grid g-3">' +
+        '<div class="field"><label for="set-theme">Theme</label><select id="set-theme" data-act="set-theme">' +
+          '<option value="light"' + (State.theme === 'light' ? ' selected' : '') + '>Light</option>' +
+          '<option value="dark"' + (State.theme === 'dark' ? ' selected' : '') + '>Dark</option>' +
+        '</select><div class="hint">Persisted under sc_theme and applied before first paint.</div></div>' +
+        '<div class="field"><label for="set-email">Email notifications</label><select id="set-email" data-act="set-email"' +
+          (canEdit ? '' : ' disabled') + '>' +
+          '<option value="true"' + (s.notifications.email ? ' selected' : '') + '>Enabled</option>' +
+          '<option value="false"' + (!s.notifications.email ? ' selected' : '') + '>Disabled</option></select></div>' +
+        '<div class="field"><label for="set-sms">SMS notifications (placeholder)</label><select id="set-sms" disabled>' +
+          '<option>' + (s.notifications.sms ? 'Enabled' : 'Disabled') + '</option></select>' +
+          '<div class="hint">SMS is a placeholder in this MVP; no gateway is connected.</div></div>' +
+      '</div></div>';
+
+    html += '<div class="card"><div class="card-head"><h2>Institution</h2></div>' +
+      '<div class="grid g-2">' +
+        '<div class="field"><label for="set-name">University name</label><input id="set-name" type="text" value="' +
+          esc(s.institution.name) + '"' + (canEdit ? '' : ' disabled') + '></div>' +
+        '<div class="field"><label for="set-logo">Logo text</label><input id="set-logo" type="text" value="' +
+          esc(s.institution.logoText) + '"' + (canEdit ? '' : ' disabled') + '></div>' +
+        '<div class="field"><label for="set-address">Address</label><input id="set-address" type="text" value="' +
+          esc(s.institution.address) + '"' + (canEdit ? '' : ' disabled') + '></div>' +
+        '<div class="field"><label for="set-contact">Contact information</label><input id="set-contact" type="text" value="' +
+          esc(s.institution.contact) + '"' + (canEdit ? '' : ' disabled') + '></div>' +
+      '</div></div>';
+
+    html += '<div class="card"><div class="card-head"><h2>Academic rules</h2></div>' +
+      '<div class="grid g-3">' +
+        '<div class="field"><label for="set-pass">Pass mark (0–100)</label><input id="set-pass" type="number" min="0" max="100" value="' +
+          s.academic.passMark + '"' + (canEdit ? '' : ' disabled') + '></div>' +
+        '<div class="field"><label for="set-att">Attendance threshold (%)</label><input id="set-att" type="number" min="0" max="100" value="' +
+          s.academic.attendanceThreshold + '"' + (canEdit ? '' : ' disabled') + '></div>' +
+        '<div class="field"><label for="set-credits">Credits required for graduation</label><input id="set-credits" type="number" min="1" value="' +
+          s.academic.requiredCredits + '"' + (canEdit ? '' : ' disabled') + '></div>' +
+      '</div>' +
+      '<h3>Grading scale</h3>' +
+      UI.table(['Grade', 'Minimum score', 'Grade point'],
+        s.academic.gradingScale.map(function (g) { return [esc(g.grade), g.min, g.point]; })) +
+      '<p class="hint">The grading scale is configurable because universities operate different systems. ' +
+      'Grade point and credit unit are stored on each result record so that historical GPAs remain stable if the scale changes.</p>' +
+      '</div>';
+
+    html += '<div class="card"><div class="card-head"><h2>Risk model thresholds</h2></div>' +
+      '<div class="grid g-4">' +
+        '<div class="field"><label for="set-gpa">GPA threshold</label><input id="set-gpa" type="number" step="0.1" min="0" max="5" value="' +
+          s.risk.gpaThreshold + '"' + (canEdit ? '' : ' disabled') + '></div>' +
+        '<div class="field"><label for="set-ratt">Attendance threshold (%)</label><input id="set-ratt" type="number" min="0" max="100" value="' +
+          s.risk.attendanceThreshold + '"' + (canEdit ? '' : ' disabled') + '></div>' +
+        '<div class="field"><label for="set-fail">Failure threshold (courses)</label><input id="set-fail" type="number" min="1" value="' +
+          s.risk.failureThreshold + '"' + (canEdit ? '' : ' disabled') + '></div>' +
+        '<div class="field"><label for="set-dec">Declining-performance threshold</label><input id="set-dec" type="number" step="0.1" min="0" value="' +
+          s.risk.decliningThreshold + '"' + (canEdit ? '' : ' disabled') + '></div>' +
+      '</div>' +
+      (canEdit
+        ? '<div class="actions"><button class="btn btn-primary" data-act="save-settings">Save settings</button>' +
+          '<button class="btn" data-act="reload-settings">Discard changes</button></div>'
+        : '<p class="hint">Only a University Administrator or Super Administrator may change institutional settings.</p>') +
+      '</div>';
+
+    html += '<div class="card"><div class="card-head"><h2>Privacy notice</h2></div>' +
+      '<p>Academic records are sensitive personal data. This application displays records strictly according to the signed-in role: ' +
+      'a student sees only their own record, a lecturer sees only students enrolled in the courses they teach, and a department administrator ' +
+      'sees only their own department. Adviser notes are not exposed to general users.</p>' +
+      '<p>This prototype does not claim compliance with any data-protection regime. No consent mechanism, retention schedule, encryption at rest ' +
+      'or compliance verification has been implemented. Production deployment must add server-side authorisation, encryption, audit storage, ' +
+      'retention rules and the applicable local, FERPA or GDPR obligations.</p></div>';
+
+    return {
+      title: 'Settings',
+      subtitle: 'Institutional configuration, risk thresholds and privacy position.',
+      html: html
+    };
+  };
+
+  /* ---- profile --------------------------------------------------------- */
+  Pages.profile = function (user) {
+    var html = '<div class="card"><div class="card-head">' +
+      '<div class="avatar" style="width:52px;height:52px;font-size:1.05rem">' + esc(initials(user.name)) + '</div>' +
+      '<div><h2 style="margin:0">' + esc(user.name) + '</h2>' +
+      '<p class="hint" style="margin:0">' + esc(user.email) + ' · ' + esc(ROLE_LABEL[user.role] || user.role) + '</p></div></div>' +
+      '<dl class="kv">' +
+        '<dt>University ID</dt><dd>' + esc(user.universityId || '—') + '</dd>' +
+        '<dt>Faculty</dt><dd>' + esc(user.faculty || '—') + '</dd>' +
+        '<dt>Department</dt><dd>' + esc(user.department || '—') + '</dd>' +
+        '<dt>Programme</dt><dd>' + esc(user.programme || '—') + '</dd>' +
+        '<dt>Level</dt><dd>' + esc(user.level || '—') + '</dd>' +
+        '<dt>Phone</dt><dd>' + esc(user.phone || '—') + '</dd>' +
+        '<dt>Last login</dt><dd>' + esc(user.lastLogin ? fmtDateTime(user.lastLogin) : '—') + '</dd>' +
+        '<dt>Status</dt><dd>' + UI.statusBadge(user.status) + '</dd>' +
+      '</dl></div>';
+
+    html += '<div class="card"><div class="card-head"><h2>Update profile</h2></div>' +
+      '<div class="grid g-2">' +
+        '<div class="field"><label for="pf-name">Full name</label><input id="pf-name" type="text" value="' + esc(user.name) + '"></div>' +
+        '<div class="field"><label for="pf-phone">Phone</label><input id="pf-phone" type="tel" value="' + esc(user.phone || '') + '"></div>' +
+      '</div>' +
+      '<div class="actions"><button class="btn btn-primary" data-act="save-profile">Save profile</button></div></div>';
+
+    html += '<div class="card"><div class="card-head"><h2>Change password</h2></div>' +
+      '<div class="grid g-3">' +
+        '<div class="field"><label for="pw-old">Current password</label><input id="pw-old" type="password"></div>' +
+        '<div class="field"><label for="pw-new">New password</label><input id="pw-new" type="password"></div>' +
+        '<div class="field"><label for="pw-conf">Confirm new password</label><input id="pw-conf" type="password"></div>' +
+      '</div>' +
+      '<div class="actions"><button class="btn btn-primary" data-act="change-password">Change password</button></div>' +
+      '<p class="hint">Demonstration only. In production, passwords must be hashed with a salted adaptive algorithm and validated server-side.</p></div>';
+
+    return { title: 'My Profile', subtitle: 'Account details and preferences.', html: html };
+  };
+
+  /* ---- public landing page --------------------------------------------- */
+  Pages.landing = function () {
+    return {
+      auth: true,
+      html: '<div class="landing">' +
+        '<header class="landing-nav">' +
+          '<a class="landing-brand" href="#/home" aria-label="AcademicIQ home"><span class="landing-mark">A</span>' +
+            '<span>Academic<span>IQ</span></span></a>' +
+          '<nav aria-label="Main navigation"><a href="#" data-act="landing-features">Platform</a>' +
+            '<a href="#" data-act="landing-how">How it works</a><a href="#/login">For universities</a></nav>' +
+          '<a class="btn landing-signin" href="#/login">Sign in <span aria-hidden="true">→</span></a>' +
+        '</header>' +
+        '<main id="main">' +
+          '<section class="landing-hero">' +
+            '<div class="landing-copy">' +
+              '<div class="landing-eyebrow"><span></span> A clearer view of student success</div>' +
+              '<h1>Turn academic data into <em>better outcomes.</em></h1>' +
+              '<p class="landing-lead">Bring student performance, course results and early support into one thoughtful workspace—so your university can act with confidence.</p>' +
+              '<div class="landing-actions"><a class="landing-cta" href="#/login">Explore the dashboard <span aria-hidden="true">→</span></a>' +
+                '<a class="landing-secondary" href="#" data-act="landing-features">See what you can do <span aria-hidden="true">↓</span></a></div>' +
+              '<div class="landing-proof"><div class="landing-avatars" aria-hidden="true"><span>AD</span><span>LC</span><span>ST</span></div>' +
+                '<span>One connected view for every academic team</span></div>' +
+            '</div>' +
+            '<div class="landing-visual" aria-label="Illustrative dashboard preview">' +
+              '<div class="landing-orbit landing-orbit-one"></div><div class="landing-orbit landing-orbit-two"></div>' +
+              '<div class="preview-card">' +
+                '<div class="preview-top"><div><span class="preview-kicker">ACADEMIC OVERVIEW</span><strong>Student success</strong></div>' +
+                  '<span class="preview-period">2025 / 26 <span aria-hidden="true">⌄</span></span></div>' +
+                '<div class="preview-metrics"><div><span>Average GPA</span><strong>3.42 <small>/ 5.0</small></strong><i>↗ 8.4% this year</i></div>' +
+                  '<div><span>Students on track</span><strong>86<small>%</small></strong><i>Across all faculties</i></div></div>' +
+                '<div class="preview-chart-head"><strong>Performance over time</strong><span>GPA trend</span></div>' +
+                '<svg class="preview-chart" viewBox="0 0 520 150" role="img" aria-label="Illustrative GPA performance trend rising over six academic periods">' +
+                  '<defs><linearGradient id="landing-fill" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stop-color="#49b9a0" stop-opacity=".25"/><stop offset="1" stop-color="#49b9a0" stop-opacity="0"/></linearGradient></defs>' +
+                  '<path d="M24 112 C72 105 76 86 121 91 S190 103 222 75 S285 85 319 59 S380 68 413 43 S470 47 496 20 L496 138 L24 138 Z" fill="url(#landing-fill)"/>' +
+                  '<path d="M24 112 C72 105 76 86 121 91 S190 103 222 75 S285 85 319 59 S380 68 413 43 S470 47 496 20" fill="none" stroke="#168675" stroke-width="3" stroke-linecap="round"/>' +
+                  '<circle cx="496" cy="20" r="5" fill="#168675" stroke="#fff" stroke-width="3"/>' +
+                  '<path d="M24 138H496M24 98H496M24 58H496M24 18H496" stroke="#e9eef2" stroke-width="1"/>' +
+                  '<g fill="#84939b" font-size="10" font-family="sans-serif"><text x="24" y="149">2022</text><text x="116" y="149">2023</text><text x="210" y="149">2024</text><text x="304" y="149">2025</text><text x="396" y="149">2026</text><text x="472" y="149">NOW</text></g></svg>' +
+                '<div class="preview-foot"><span><i></i> Average GPA</span><span>Illustrative preview</span></div>' +
+              '</div>' +
+              '<div class="preview-float"><span class="float-icon">✓</span><span><strong>Early support</strong><small>See who may need a hand</small></span></div>' +
+              '<div class="preview-note"><span>↗</span><strong>Insights<br>that move you forward</strong></div>' +
+            '</div>' +
+          '</section>' +
+          '<section class="landing-trust" aria-label="Platform focus"><span>BUILT FOR THE PEOPLE BEHIND</span>' +
+            '<strong>Student success</strong><i></i><strong>Academic insight</strong><i></i><strong>Timely support</strong></section>' +
+          '<section class="landing-features" id="landing-features"><div class="landing-section-head">' +
+            '<span class="landing-label">A connected academic picture</span><h2>From scattered records to <em>meaningful action.</em></h2>' +
+            '<p>Everything your team needs to understand performance and put the right support within reach.</p></div>' +
+            '<div class="landing-feature-grid">' +
+              '<article class="landing-feature"><span class="feature-icon feature-blue">↗</span><h3>See the whole picture</h3><p>Explore clear, filterable views of student, course, cohort and faculty performance.</p><a href="#/login">Explore analytics <span>→</span></a></article>' +
+              '<article class="landing-feature"><span class="feature-icon feature-gold">◎</span><h3>Spot signals sooner</h3><p>Surface attendance and results patterns that can help teams prioritise timely support.</p><a href="#/login">Discover early insights <span>→</span></a></article>' +
+              '<article class="landing-feature"><span class="feature-icon feature-green">▤</span><h3>Turn insight into follow-through</h3><p>Coordinate interventions, track outcomes and bring important details into one place.</p><a href="#/login">See the workflow <span>→</span></a></article>' +
+            '</div></section>' +
+          '<section class="landing-how" id="landing-how"><div><span class="landing-label">MADE FOR ACADEMIC TEAMS</span>' +
+            '<h2>Better decisions start with <em>better visibility.</em></h2><p>AcademicIQ helps administrators, lecturers, advisers and students work from a shared, role-appropriate view of academic progress.</p>' +
+            '<a class="landing-cta" href="#/login">Enter the demo <span aria-hidden="true">→</span></a></div>' +
+            '<div class="landing-steps"><div><span>01</span><p><strong>Bring records together</strong><small>Review academic data in one consistent workspace.</small></p></div>' +
+              '<div><span>02</span><p><strong>Understand what is changing</strong><small>Use trends and comparisons to see where attention matters.</small></p></div>' +
+              '<div><span>03</span><p><strong>Support the next step</strong><small>Coordinate action and keep progress visible.</small></p></div></div></section>' +
+        '</main>' +
+        '<footer class="landing-footer"><a class="landing-brand" href="#/home"><span class="landing-mark">A</span><span>Academic<span>IQ</span></span></a>' +
+          '<span>Academic insight, with student success in mind.</span><a href="#/login">Sign in <span aria-hidden="true">→</span></a></footer>' +
+      '</div>'
+    };
+  };
+
+  /* ---- auth pages ------------------------------------------------------ */
+  Pages.login = function () {
+    var html = '<div class="auth-card">' +
+      '<a class="auth-brand" href="#/home" aria-label="Back to AcademicIQ home"><span class="mark">AIQ</span><span><span class="name">AcademicIQ</span>' +
+      '<span class="tag">Turn Academic Data Into Better Student Outcomes.</span></span></a>' +
+      '<h1>Sign in</h1>' +
+      '<p class="hint">Enter your university email or ID and password to continue. This demonstration uses browser-stored accounts and must not be used with real student data.</p>' +
+      '<form id="login-form" novalidate>' +
+        '<div class="field"><label for="login-email">University email or ID</label>' +
+          '<input id="login-email" type="email" autocomplete="username" required aria-describedby="login-email-err">' +
+          '<div class="err" id="login-email-err" role="alert" aria-live="polite"></div></div>' +
+        '<div class="field"><label for="login-password">Password</label>' +
+          '<input id="login-password" type="password" autocomplete="current-password" required aria-describedby="login-pw-err">' +
+          '<div class="err" id="login-pw-err" role="alert" aria-live="polite"></div></div>' +
+        '<div class="field" style="display:flex;align-items:center;gap:8px">' +
+          '<input id="login-remember" type="checkbox" style="width:auto">' +
+          '<label for="login-remember" style="margin:0">Keep me signed in</label></div>' +
+        '<div class="err" id="login-err" role="alert" aria-live="assertive"></div>' +
+        '<button class="btn btn-primary btn-block" type="submit">Sign in</button>' +
+      '</form>' +
+      '<div class="auth-foot"><a href="#/home">Back to home</a> · <a href="#/register">Create an account</a> · <a href="#/forgot-password">Forgot password</a></div>' +
+      '</div>';
+
+    return {
+      auth: true, html: html,
+      mount: function () {
+        var form = $('#login-form');
+        if (!form) { return; }
+        form.addEventListener('submit', function (e) {
+          e.preventDefault();
+          var email = $('#login-email').value;
+          var pw = $('#login-password').value;
+          var rem = $('#login-remember').checked;
+          $('#login-email-err').textContent = '';
+          $('#login-pw-err').textContent = '';
+          $('#login-err').textContent = '';
+          var bad = false;
+          if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+            $('#login-email-err').textContent = 'Enter a valid university email address.';
+            bad = true;
+          }
+          if (!pw) { $('#login-pw-err').textContent = 'Password is required.'; bad = true; }
+          if (bad) { return; }
+          var res = Auth.signIn(email, pw, rem);
+          if (!res.ok) { $('#login-err').textContent = res.error; return; }
+          UI.toast('Signed in', 'Welcome, ' + res.user.name + '.', 'good');
+          var intended = Store.get('sc_intended_route', null);
+          Store.remove('sc_intended_route');
+          location.hash = intended ? intended : '#/dashboard';
+          render();
+        });
+      }
+    };
+  };
+
+  Pages.register = function () {
+    var faculties = Service.faculties();
+    var departments = Service.departments();
+    var html = '<div class="auth-card wide">' +
+      '<div class="auth-brand"><span class="mark">AIQ</span><span><span class="name">AcademicIQ</span>' +
+      '<span class="tag">Create an account</span></span></div>' +
+      '<h1>Register</h1>' +
+      '<p class="hint">Demonstration registration. The account is stored in the browser only.</p>' +
+      '<form id="reg-form" novalidate>' +
+      '<div class="grid g-2">' +
+        '<div class="field"><label for="rg-name">Full name *</label><input id="rg-name" type="text" required><div class="err" role="alert"></div></div>' +
+        '<div class="field"><label for="rg-uid">University ID</label><input id="rg-uid" type="text"></div>' +
+        '<div class="field"><label for="rg-email">Email *</label><input id="rg-email" type="email" required><div class="err" role="alert"></div></div>' +
+        '<div class="field"><label for="rg-phone">Phone</label><input id="rg-phone" type="tel"></div>' +
+        '<div class="field"><label for="rg-role">Role *</label><select id="rg-role">' +
+          ALL_ROLES.map(function (r) { return '<option value="' + r + '">' + esc(ROLE_LABEL[r]) + '</option>'; }).join('') +
+        '</select></div>' +
+        '<div class="field"><label for="rg-level">Level</label><select id="rg-level"><option value="">—</option>' +
+          ['100', '200', '300', '400'].map(function (l) { return '<option>' + l + '</option>'; }).join('') + '</select></div>' +
+        '<div class="field"><label for="rg-faculty">Faculty</label><select id="rg-faculty"><option value="">—</option>' +
+          faculties.map(function (f) { return '<option>' + esc(f.name) + '</option>'; }).join('') + '</select></div>' +
+        '<div class="field"><label for="rg-dept">Department</label><select id="rg-dept"><option value="">—</option>' +
+          departments.map(function (d) { return '<option>' + esc(d.name) + '</option>'; }).join('') + '</select></div>' +
+        '<div class="field"><label for="rg-prog">Programme</label><select id="rg-prog"><option value="">—</option>' +
+          Service.programmes().map(function (p) { return '<option>' + esc(p.name) + '</option>'; }).join('') + '</select></div>' +
+        '<div class="field"><label for="rg-pw">Password * (minimum 8 characters)</label><input id="rg-pw" type="password" required><div class="err" role="alert"></div></div>' +
+        '<div class="field"><label for="rg-pw2">Confirm password *</label><input id="rg-pw2" type="password" required><div class="err" role="alert"></div></div>' +
+      '</div>' +
+      '<div class="err" id="rg-err" role="alert" aria-live="assertive"></div>' +
+      '<button class="btn btn-primary btn-block" type="submit">Create account</button>' +
+      '</form>' +
+      '<div class="auth-foot"><a href="#/login">Already have an account? Sign in</a></div>' +
+      '</div>';
+
+    return {
+      auth: true, html: html,
+      mount: function () {
+        var form = $('#reg-form');
+        if (!form) { return; }
+        form.addEventListener('submit', function (e) {
+          e.preventDefault();
+          var name = $('#rg-name').value.trim();
+          var email = $('#rg-email').value.trim();
+          var pw = $('#rg-pw').value;
+          var pw2 = $('#rg-pw2').value;
+          $('#rg-err').textContent = '';
+          if (!name) { UI.toast('Registration', 'Full name is required.', 'bad'); return; }
+          if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) { UI.toast('Registration', 'Enter a valid email address.', 'bad'); return; }
+          if (pw.length < 8) { UI.toast('Registration', 'Password must be at least 8 characters.', 'bad'); return; }
+          if (pw !== pw2) { UI.toast('Registration', 'Passwords do not match.', 'bad'); return; }
+          var res = Auth.register({
+            name: name, email: email, password: pw, role: $('#rg-role').value,
+            universityId: $('#rg-uid').value, phone: $('#rg-phone').value,
+            faculty: $('#rg-faculty').value, department: $('#rg-dept').value,
+            programme: $('#rg-prog').value, level: $('#rg-level').value || null
+          });
+          if (!res.ok) { $('#rg-err').textContent = res.error; return; }
+          UI.toast('Account created', 'You can now sign in.', 'good');
+          location.hash = '#/login';
+          render();
+        });
+      }
+    };
+  };
+
+  Pages.forgot = function () {
+    var html = '<div class="auth-card">' +
+      '<div class="auth-brand"><span class="mark">AIQ</span><span><span class="name">AcademicIQ</span>' +
+      '<span class="tag">Password reset</span></span></div>' +
+      '<h1>Forgot password</h1>' +
+      '<p class="hint">Demonstration flow. A production build must send a single-use, time-limited reset token by email and must never disclose whether an address exists.</p>' +
+      '<div class="field"><label for="fp-email">University email</label><input id="fp-email" type="email"></div>' +
+      '<button class="btn btn-primary btn-block" data-act="request-reset">Request reset link</button>' +
+      '<div class="field" style="margin-top:16px"><label for="fp-new">New password</label><input id="fp-new" type="password"></div>' +
+      '<button class="btn btn-block" data-act="apply-reset">Apply new password</button>' +
+      '<div class="auth-foot"><a href="#/login">Back to sign in</a></div></div>';
+    return { auth: true, html: html };
+  };
+
+  Pages.denied = function () { return { title: 'Access restricted', subtitle: '', html: UI.denied() }; };
+  Pages.notFound = function () {
+    return {
+      title: 'Page not found', subtitle: '',
+      html: UI.empty('The page you requested does not exist. Use the navigation to continue.', 'Not found')
+    };
+  };
+
+  /* ======================================================================
+     11. ROUTER AND SHELL
+     ====================================================================== */
+  var ACCESS = {
+    dashboard: ALL_ROLES,
+    students: ['lecturer', 'department_admin', 'adviser', 'university_admin', 'super_admin'],
+    student: ['lecturer', 'department_admin', 'adviser', 'university_admin', 'super_admin'],
+    courses: ['lecturer', 'department_admin', 'adviser', 'university_admin', 'super_admin'],
+    course: ['lecturer', 'department_admin', 'adviser', 'university_admin', 'super_admin'],
+    departments: ['department_admin', 'adviser', 'university_admin', 'super_admin'],
+    faculty: ['department_admin', 'university_admin', 'super_admin'],
+    cohorts: ['lecturer', 'department_admin', 'adviser', 'university_admin', 'super_admin'],
+    analytics: ['lecturer', 'department_admin', 'adviser', 'university_admin', 'super_admin'],
+    'at-risk': ['lecturer', 'department_admin', 'adviser', 'university_admin', 'super_admin'],
+    interventions: ['adviser', 'department_admin', 'university_admin', 'super_admin'],
+    reports: ['lecturer', 'department_admin', 'adviser', 'university_admin', 'super_admin'],
+    'data-import': ['university_admin', 'super_admin'],
+    notifications: ALL_ROLES,
+    alerts: ALL_ROLES,
+    audit: ['university_admin', 'super_admin'],
+    users: ['super_admin'],
+    structure: ['university_admin', 'super_admin'],
+    semesters: ['university_admin', 'super_admin'],
+    'data-management': ['super_admin'],
+    settings: ALL_ROLES,
+    profile: ALL_ROLES,
+    denied: ALL_ROLES
+  };
+
+  var NAV = [
+    { group: 'Analytics', items: [
+      { path: 'dashboard', label: 'Dashboard', ico: '▦' },
+      { path: 'analytics', label: 'Analytics', ico: '◔' },
+      { path: 'at-risk', label: 'At-Risk Students', ico: '⚠', badge: true },
+      { path: 'cohorts', label: 'Cohorts', ico: '⧉' }
+    ] },
+    { group: 'Records', items: [
+      { path: 'students', label: 'Students', ico: '☰' },
+      { path: 'courses', label: 'Courses', ico: '▤' },
+      { path: 'departments', label: 'Departments', ico: '⬒' },
+      { path: 'faculty', label: 'Faculty', ico: '⬓' },
+      { path: 'interventions', label: 'Interventions', ico: '✎' }
+    ] },
+    { group: 'Data', items: [
+      { path: 'reports', label: 'Reports', ico: '🖹' },
+      { path: 'data-import', label: 'Data Import', ico: '⇪' },
+      { path: 'notifications', label: 'Notifications', ico: '🔔', badge: true },
+      { path: 'alerts', label: 'Alert Centre', ico: '❗' }
+    ] },
+    { group: 'Administration', items: [
+      { path: 'users', label: 'User Management', ico: '👤' },
+      { path: 'structure', label: 'Academic Structure', ico: '⚙' },
+      { path: 'semesters', label: 'Semesters', ico: '🗓' },
+      { path: 'data-management', label: 'Data Management', ico: '🗄' },
+      { path: 'audit', label: 'Audit Log', ico: '📋' }
+    ] },
+    { group: 'Account', items: [
+      { path: 'profile', label: 'My Profile', ico: '◍' },
+      { path: 'settings', label: 'Settings', ico: '⚙' }
+    ] }
+  ];
+
+  function parseHash() {
+    var h = String(location.hash || '').replace(/^#\/?/, '');
+    if (!h) { return { path: Auth.current() ? 'dashboard' : 'login', param: '' }; }
+    var parts = h.split('/');
+    return { path: parts[0] || 'dashboard', param: parts[1] || '' };
+  }
+
+  function canAccess(role, path) {
+    var allowed = ACCESS[path];
+    if (!allowed) { return false; }
+    return allowed.indexOf(role) >= 0;
+  }
+
+  function navHtml(user, current) {
+    var unread = Service.unreadCount();
+    var out = '';
+    NAV.forEach(function (grp) {
+      var visible = grp.items.filter(function (it) { return canAccess(user.role, it.path); });
+      if (!visible.length) { return; }
+      out += '<div class="nav-group">' + esc(grp.group) + '</div>';
+      visible.forEach(function (it) {
+        var isActive = current === it.path;
+        var badge = (it.badge && unread > 0) ? '<span class="pill">' + unread + '</span>' : '';
+        out += '<a href="#/' + it.path + '"' + (isActive ? ' class="active" aria-current="page"' : '') + '>' +
+          '<span class="ico" aria-hidden="true">' + it.ico + '</span>' + esc(it.label) + badge + '</a>';
+      });
+    });
+    return out;
+  }
+
+  function shellHtml(user, page, current) {
+    var settings = Service.settings();
+    var unread = Service.unreadCount();
+    var alerts = Service.alerts().filter(function (a) { return !a.read; }).length;
+    return '' +
+      '<div class="app">' +
+        '<aside class="sidebar" id="sidebar" aria-label="Primary navigation">' +
+          '<div class="brand"><span class="mark">AIQ</span><span>' +
+            '<span class="name">AcademicIQ</span><span class="tag">' + esc(settings.institution.name) + '</span></span></div>' +
+          '<nav class="nav">' + navHtml(user, current) + '</nav>' +
+          '<div class="who"><strong>' + esc(user.name) + '</strong>' + esc(ROLE_LABEL[user.role] || user.role) + '</div>' +
+        '</aside>' +
+        '<div class="main">' +
+          '<header class="topbar">' +
+            '<button class="hamburger" data-act="toggle-sidebar" aria-label="Toggle navigation" aria-expanded="false">☰</button>' +
+            '<div class="search-wrap"><label class="sr-only" for="global-search">Global search</label>' +
+              '<input id="global-search" type="text" placeholder="Search students, courses, departments, faculties, programmes, reports…" autocomplete="off" role="combobox" aria-expanded="false" aria-controls="suggest">' +
+              '<div id="suggest" class="suggest" role="listbox" style="display:none"></div></div>' +
+            '<div class="spacer"></div>' +
+            '<a class="icon-btn" href="#/alerts" aria-label="Alert centre">❗' +
+              (alerts ? '<span class="badge-dot">' + alerts + '</span>' : '') + '</a>' +
+            '<a class="icon-btn" href="#/notifications" aria-label="Notifications">🔔' +
+              (unread ? '<span class="badge-dot">' + unread + '</span>' : '') + '</a>' +
+            '<button class="icon-btn" data-act="toggle-theme" aria-label="Toggle colour theme">' +
+              (State.theme === 'dark' ? '☀' : '☾') + '</button>' +
+            '<div class="user-chip"><span class="avatar">' + esc(initials(user.name)) + '</span>' +
+              '<span><span class="u-name">' + esc(user.name) + '</span><br><span class="u-role">' +
+                esc(ROLE_LABEL[user.role] || user.role) + '</span></span></div>' +
+            '<button class="btn btn-sm" data-act="signout">Sign out</button>' +
+          '</header>' +
+          '<main class="content" id="main">' +
+            '<div class="page-head no-print"><div class="titles"><h1>' + esc(page.title || '') + '</h1>' +
+              (page.subtitle ? '<p class="sub">' + esc(page.subtitle) + '</p>' : '') + '</div></div>' +
+            page.html +
+          '</main>' +
+          '<nav class="mobile-nav" aria-label="Mobile navigation">' +
+            '<a href="#/dashboard" class="' + (current === 'dashboard' ? 'active' : '') + '"><span class="ico">▦</span>Dashboard</a>' +
+            (canAccess(user.role, 'students')
+              ? '<a href="#/students" class="' + (current === 'students' ? 'active' : '') + '"><span class="ico">☰</span>Students</a>' : '') +
+            (canAccess(user.role, 'at-risk')
+              ? '<a href="#/at-risk" class="' + (current === 'at-risk' ? 'active' : '') + '"><span class="ico">⚠</span>At-risk</a>' : '') +
+            (canAccess(user.role, 'reports')
+              ? '<a href="#/reports" class="' + (current === 'reports' ? 'active' : '') + '"><span class="ico">🖹</span>Reports</a>' : '') +
+            '<a href="#/notifications" class="' + (current === 'notifications' ? 'active' : '') + '"><span class="ico">🔔</span>Alerts</a>' +
+          '</nav>' +
+        '</div>' +
+      '</div>';
+  }
+
+  function render() {
+    var app = $('#app');
+    var route = parseHash();
+    var user = Auth.current();
+    var page;
+
+    try {
+      if (route.path === 'home') { page = user ? Pages.dashboard(user) : Pages.landing(); }
+      else if (route.path === 'login') { page = Pages.login(); }
+      else if (route.path === 'register') { page = Pages.register(); }
+      else if (route.path === 'forgot-password') { page = Pages.forgot(); }
+      else if (!user) {
+        Store.set('sc_intended_route', '#/' + route.path + (route.param ? '/' + route.param : ''));
+        page = Pages.login();
+      } else if (route.path === 'denied') { page = Pages.denied(); }
+      else if (!ACCESS[route.path]) { page = Pages.notFound(); }
+      else if (!canAccess(user.role, route.path)) { page = Pages.denied(); }
+      else if (route.path === 'dashboard') { page = Pages.dashboard(user); }
+      else if (route.path === 'students') { page = Pages.students(user); }
+      else if (route.path === 'student') { page = Pages.studentProfile(user, route.param); }
+      else if (route.path === 'courses') { page = Pages.courses(user); }
+      else if (route.path === 'course') { page = Pages.courseDetails(user, route.param); }
+      else if (route.path === 'departments') { page = Pages.departments(user); }
+      else if (route.path === 'faculty') { page = Pages.faculty(user); }
+      else if (route.path === 'cohorts') { page = Pages.cohorts(user); }
+      else if (route.path === 'analytics') { page = Pages.analytics(user); }
+      else if (route.path === 'at-risk') { page = Pages.atRisk(user); }
+      else if (route.path === 'interventions') { page = Pages.interventions(user); }
+      else if (route.path === 'reports') { page = Pages.reports(user); }
+      else if (route.path === 'data-import') { page = Pages.dataImport(user); }
+      else if (route.path === 'notifications') { page = Pages.notifications(user); }
+      else if (route.path === 'alerts') { page = Pages.alerts(user); }
+      else if (route.path === 'audit') { page = Pages.audit(user); }
+      else if (route.path === 'users') { page = Pages.users(user); }
+      else if (route.path === 'structure') { page = Pages.structure(user); }
+      else if (route.path === 'semesters') { page = Pages.semesters(user); }
+      else if (route.path === 'data-management') { page = Pages.dataManagement(user); }
+      else if (route.path === 'settings') { page = Pages.settings(user); }
+      else if (route.path === 'profile') { page = Pages.profile(user); }
+      else { page = Pages.notFound(); }
+    } catch (err) {
+      page = { title: 'Error', subtitle: '', html: UI.error(String(err && err.message ? err.message : err)) };
+    }
+
+    if (page.auth || !user) {
+      app.innerHTML = page.html;
+    } else {
+      app.innerHTML = shellHtml(user, page, route.path === 'home' ? 'dashboard' : route.path);
+      bindFilters(app);
+      bindGlobalSearch();
+    }
+
+    if (typeof page.mount === 'function') { page.mount(); }
+    window.scrollTo(0, 0);
+  }
+
+  /* ======================================================================
+     12. GLOBAL SEARCH
+     ====================================================================== */
+  function searchEverything(q) {
+    var out = [];
+    q = String(q).toLowerCase().trim();
+    if (!q) { return out; }
+    Service.students().forEach(function (s) {
+      if ((s.name + ' ' + s.studentId + ' ' + s.email).toLowerCase().indexOf(q) >= 0) {
+        out.push({ type: 'Student', label: s.name + ' · ' + s.studentId, href: '#/student/' + s.id });
+      }
+    });
+    Service.courses().forEach(function (c) {
+      if ((c.code + ' ' + c.title).toLowerCase().indexOf(q) >= 0) {
+        out.push({ type: 'Course', label: c.code + ' · ' + c.title, href: '#/course/' + c.id });
+      }
+    });
+    Service.departments().forEach(function (d) {
+      if (d.name.toLowerCase().indexOf(q) >= 0) { out.push({ type: 'Department', label: d.name, href: '#/departments' }); }
+    });
+    Service.faculties().forEach(function (f) {
+      if (f.name.toLowerCase().indexOf(q) >= 0) { out.push({ type: 'Faculty', label: f.name, href: '#/faculty' }); }
+    });
+    Service.programmes().forEach(function (p) {
+      if (p.name.toLowerCase().indexOf(q) >= 0) { out.push({ type: 'Programme', label: p.name, href: '#/cohorts' }); }
+    });
+    REPORT_TYPES.forEach(function (t) {
+      if (t.toLowerCase().indexOf(q) >= 0) { out.push({ type: 'Report', label: t, href: '#/reports' }); }
+    });
+    return out.slice(0, 12);
+  }
+
+  function bindGlobalSearch() {
+    var input = $('#global-search');
+    var box = $('#suggest');
+    if (!input || !box) { return; }
+
+    var run = debounce(function () {
+      var results = searchEverything(input.value);
+      if (!input.value.trim()) {
+        box.style.display = 'none';
+        input.setAttribute('aria-expanded', 'false');
+        return;
+      }
+      box.innerHTML = results.length
+        ? results.map(function (r) {
+            return '<button type="button" role="option" data-href="' + esc(r.href) + '">' + esc(r.label) +
+              '<span class="s-type">' + esc(r.type) + '</span></button>';
+          }).join('')
+        : '<div class="s-empty">No student, course, department, faculty, programme or report matches that search.</div>';
+      box.style.display = 'block';
+      input.setAttribute('aria-expanded', 'true');
+      $$('button[data-href]', box).forEach(function (b) {
+        b.addEventListener('click', function () {
+          box.style.display = 'none';
+          input.value = '';
+          location.hash = b.getAttribute('data-href');
+          render();
+        });
+      });
+    }, 180);
+
+    input.addEventListener('input', run);
+    input.addEventListener('keydown', function (e) { if (e.key === 'Escape') { box.style.display = 'none'; } });
+    document.addEventListener('click', function (e) {
+      if (!box.contains(e.target) && e.target !== input) { box.style.display = 'none'; }
+    });
+  }
+
+  /* ======================================================================
+     13. EVENT DELEGATION
+     ====================================================================== */
+  function findStudentForAction(id) {
+    var st = Service.student(id);
+    if (!st) { UI.toast('Not found', 'That student record does not exist.', 'bad'); return null; }
+    return st;
+  }
+
+  function exportRows(kind, user) {
+    var ctx = Service.context(user, State.filters);
+    if (kind === 'students') {
+      UI.downloadCSV('academiciq-students.csv',
+        [['student_id', 'name', 'email', 'faculty', 'department', 'programme', 'level', 'cgpa',
+          'attendance', 'risk_band', 'risk_score', 'status']]
+          .concat(ctx.enriched.map(function (e) {
+            return [e.student.studentId, e.student.name, e.student.email, e.student.faculty, e.student.department,
+              e.student.programme, e.student.level, e.cgpa === null ? '' : e.cgpa.toFixed(2),
+              e.student.attendance, e.risk.band, e.risk.score, e.student.status];
+          })));
+      UI.toast('Export ready', 'Filtered student dataset downloaded.', 'good');
+      Service.audit('Data exported', 'students', 'Filtered student dataset exported');
+    } else if (kind === 'courses') {
+      var passMark = ctx.passMark;
+      UI.downloadCSV('academiciq-courses.csv',
+        [['code', 'title', 'department', 'credit_unit', 'enrolment', 'pass_rate', 'average_score',
+          'median_score', 'failure_rate', 'attendance']]
+          .concat(Service.visibleCourses(user).map(function (c) {
+            var rs = Service.resultsForCourse(c.id);
+            var passed = rs.filter(function (r) { return r.score >= passMark; }).length;
+            return [c.code, c.title, c.department, c.creditUnit, rs.length,
+              rs.length ? pct(passed, rs.length) : '',
+              rs.length ? round(mean(rs.map(function (r) { return r.score; })), 1) : '',
+              rs.length ? median(rs.map(function (r) { return r.score; })) : '',
+              rs.length ? pct(rs.length - passed, rs.length) : '',
+              rs.length ? round(mean(rs.map(function (r) { return r.attendance; })), 1) : ''];
+          })));
+      UI.toast('Export ready', 'Course dataset downloaded.', 'good');
+      Service.audit('Data exported', 'courses', 'Course dataset exported');
+    } else if (kind === 'atrisk') {
+      UI.downloadCSV('academiciq-at-risk.csv',
+        [['student_id', 'name', 'department', 'level', 'cgpa', 'attendance', 'failures',
+          'risk_score', 'band', 'main_factor']]
+          .concat(ctx.enriched.slice().sort(function (a, b) { return b.risk.score - a.risk.score; }).map(function (e) {
+            return [e.student.studentId, e.student.name, e.student.department, e.student.level,
+              e.cgpa === null ? '' : e.cgpa.toFixed(2), e.student.attendance, e.risk.failures,
+              e.risk.score, e.risk.band, e.risk.factors[0]];
+          })));
+      UI.toast('Export ready', 'At-risk dataset downloaded.', 'good');
+      Service.audit('Data exported', 'at-risk', 'At-risk dataset exported');
+    } else if (kind === 'departments') {
+      var groups = groupBy(ctx.enriched, function (e) { return e.student.department; });
+      UI.downloadCSV('academiciq-departments.csv',
+        [['department', 'students', 'average_gpa', 'pass_rate', 'failure_rate', 'at_risk', 'retention']]
+          .concat(Object.keys(groups).sort().map(function (d) {
+            var list = groups[d];
+            var results = [];
+            list.forEach(function (e) { results = results.concat(e.results); });
+            var gpas = list.map(function (e) { return e.cgpa; }).filter(function (v) { return v !== null; });
+            var active = list.filter(function (e) { return e.student.status === 'active'; }).length;
+            return [d, list.length, gpas.length ? round(mean(gpas), 2) : '',
+              pct(results.filter(function (r) { return r.score >= ctx.passMark; }).length, results.length),
+              pct(results.filter(function (r) { return r.score < ctx.passMark; }).length, results.length),
+              list.filter(function (e) { return e.risk.band === 'High' || e.risk.band === 'Critical'; }).length,
+              list.length ? pct(active, list.length) : ''];
+          })));
+      UI.toast('Export ready', 'Department dataset downloaded.', 'good');
+    } else if (kind === 'faculty') {
+      var gf = groupBy(ctx.enriched, function (e) { return e.student.faculty; });
+      UI.downloadCSV('academiciq-faculty.csv',
+        [['faculty', 'students', 'average_gpa', 'pass_rate', 'failure_rate', 'at_risk', 'retention']]
+          .concat(Object.keys(gf).sort().map(function (f) {
+            var list = gf[f];
+            var results = [];
+            list.forEach(function (e) { results = results.concat(e.results); });
+            var gpas = list.map(function (e) { return e.cgpa; }).filter(function (v) { return v !== null; });
+            var active = list.filter(function (e) { return e.student.status === 'active'; }).length;
+            return [f, list.length, gpas.length ? round(mean(gpas), 2) : '',
+              pct(results.filter(function (r) { return r.score >= ctx.passMark; }).length, results.length),
+              pct(results.filter(function (r) { return r.score < ctx.passMark; }).length, results.length),
+              list.filter(function (e) { return e.risk.band === 'High' || e.risk.band === 'Critical'; }).length,
+              list.length ? pct(active, list.length) : ''];
+          })));
+      UI.toast('Export ready', 'Faculty dataset downloaded.', 'good');
+    } else if (kind === 'cohorts') {
+      var gc = groupBy(ctx.enriched, function (e) { return String(e.student.level); });
+      UI.downloadCSV('academiciq-cohorts.csv',
+        [['cohort', 'students', 'average_gpa', 'pass_rate', 'failure_rate', 'at_risk']]
+          .concat(Object.keys(gc).sort().map(function (l) {
+            var list = gc[l];
+            var results = [];
+            list.forEach(function (e) { results = results.concat(e.results); });
+            var gpas = list.map(function (e) { return e.cgpa; }).filter(function (v) { return v !== null; });
+            return ['Level ' + l, list.length, gpas.length ? round(mean(gpas), 2) : '',
+              pct(results.filter(function (r) { return r.score >= ctx.passMark; }).length, results.length),
+              pct(results.filter(function (r) { return r.score < ctx.passMark; }).length, results.length),
+              list.filter(function (e) { return e.risk.band === 'High' || e.risk.band === 'Critical'; }).length];
+          })));
+      UI.toast('Export ready', 'Cohort dataset downloaded.', 'good');
+    } else if (kind === 'progression') {
+      UI.downloadCSV('academiciq-progression.csv',
+        [['student_id', 'name', 'level', 'credits_earned', 'required', 'progress_percent', 'readiness']]
+          .concat(ctx.enriched.filter(function (e) { return e.student.level === 400; }).map(function (e) {
+            var earned = Service.creditsEarned(e.allResults, ctx.passMark);
+            var required = ctx.settings.academic.requiredCredits;
+            var progress = required ? round((earned / required) * 100, 1) : 0;
+            var status = progress >= 50 ? 'Ready' : progress >= 35 ? 'On Track'
+              : progress >= 20 ? 'Needs Attention' : 'At Risk';
+            return [e.student.studentId, e.student.name, e.student.level, earned, required, progress, status];
+          })));
+      UI.toast('Export ready', 'Progression dataset downloaded.', 'good');
+    } else if (kind === 'interventions') {
+      UI.downloadCSV('academiciq-interventions.csv',
+        [['student_id', 'risk_level', 'issue', 'type', 'adviser', 'date', 'action', 'outcome', 'follow_up', 'status']]
+          .concat(Service.interventions().map(function (i) {
+            var s = Service.student(i.studentId);
+            return [s ? s.studentId : '', i.riskLevel, i.issue, i.type, i.adviser, i.date,
+              i.action, i.outcome, i.followUp, i.status];
+          })));
+      UI.toast('Export ready', 'Intervention log downloaded.', 'good');
+    } else if (kind === 'audit') {
+      UI.downloadCSV('academiciq-audit.csv',
+        [['date', 'action', 'user', 'role', 'target', 'description']]
+          .concat(Service.auditLogs().map(function (l) {
+            return [l.date, l.action, l.user, l.role, l.target, l.description];
+          })));
+      UI.toast('Export ready', 'Audit log downloaded.', 'good');
+    } else if (kind === 'users') {
+      UI.downloadCSV('academiciq-users.csv',
+        [['id', 'name', 'email', 'role', 'faculty', 'department', 'last_login', 'status']]
+          .concat(Service.users().map(function (u) {
+            return [u.id, u.name, u.email, u.role, u.faculty, u.department, u.lastLogin, u.status];
+          })));
+      UI.toast('Export ready', 'User accounts downloaded.', 'good');
+    }
+  }
+
+  document.addEventListener('click', function (e) {
+    var el = e.target.closest ? e.target.closest('[data-act]') : null;
+    if (!el) { return; }
+    var act = el.getAttribute('data-act');
+    var id = el.getAttribute('data-id');
+    var user = Auth.current();
+
+    switch (act) {
+      case 'landing-features':
+      case 'landing-how': {
+        e.preventDefault();
+        var section = document.getElementById(act === 'landing-features' ? 'landing-features' : 'landing-how');
+        if (section) { section.scrollIntoView({ behavior: 'smooth', block: 'start' }); }
+        break;
+      }
+      case 'toggle-sidebar': {
+        var sb = $('#sidebar');
+        if (sb) {
+          sb.classList.toggle('open');
+          el.setAttribute('aria-expanded', sb.classList.contains('open') ? 'true' : 'false');
+        }
+        break;
+      }
+      case 'toggle-theme': {
+        State.theme = State.theme === 'dark' ? 'light' : 'dark';
+        document.documentElement.setAttribute('data-theme', State.theme);
+        Store.set('sc_theme', State.theme);
+        render();
+        break;
+      }
+      case 'signout':
+        Auth.signOut();
+        location.hash = '#/login';
+        render();
+        UI.toast('Signed out', 'Your session has ended.', 'good');
+        break;
+      case 'request-reset': {
+        var em = $('#fp-email') ? $('#fp-email').value : '';
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(em)) { UI.toast('Reset', 'Enter a valid email address.', 'bad'); break; }
+        Service.audit('Password reset requested', em, 'Demonstration reset flow invoked');
+        UI.toast('Reset requested',
+          'In this demonstration no email is sent. Enter a new password below to apply it directly.', 'warn');
+        break;
+      }
+      case 'apply-reset': {
+        var em2 = $('#fp-email') ? $('#fp-email').value.trim() : '';
+        var np = $('#fp-new') ? $('#fp-new').value : '';
+        if (np.length < 8) { UI.toast('Reset', 'New password must be at least 8 characters.', 'bad'); break; }
+        var users = Service.users();
+        var found = users.filter(function (u) { return u.email.toLowerCase() === em2.toLowerCase(); })[0];
+        if (!found) { UI.toast('Reset', 'No account matches that address.', 'bad'); break; }
+        found.password = np;
+        Service.saveUsers(users);
+        Service.audit('Password changed', em2, 'Demonstration password reset applied');
+        UI.toast('Password updated', 'You can now sign in with the new password.', 'good');
+        break;
+      }
+      case 'clear-filters':
+        Object.keys(State.filters).forEach(function (k) { State.filters[k] = ''; });
+        State.page = 1;
+        render();
+        break;
+      case 'page-prev': State.page = Math.max(1, State.page - 1); render(); break;
+      case 'page-next': State.page = State.page + 1; render(); break;
+      case 'view-student':
+        if (id) { location.hash = '#/student/' + id; render(); }
+        break;
+      case 'export-students': exportRows('students', user); break;
+      case 'export-courses': exportRows('courses', user); break;
+      case 'export-atrisk': exportRows('atrisk', user); break;
+      case 'export-departments': exportRows('departments', user); break;
+      case 'export-faculty': exportRows('faculty', user); break;
+      case 'export-cohorts': exportRows('cohorts', user); break;
+      case 'export-progression': exportRows('progression', user); break;
+      case 'export-interventions': exportRows('interventions', user); break;
+      case 'export-audit': exportRows('audit', user); break;
+      case 'export-users': exportRows('users', user); break;
+      case 'export-all-students': exportRows('students', user); break;
+      case 'export-all-courses': exportRows('courses', user); break;
+      case 'export-all-audit': exportRows('audit', user); break;
+      case 'export-all-results': {
+        var all = Service.results();
+        UI.downloadCSV('academiciq-results.csv',
+          [['result_id', 'student_id', 'course_code', 'session', 'semester', 'score', 'grade',
+            'grade_point', 'credit_unit', 'attendance']]
+            .concat(all.map(function (r) {
+              var s = Service.student(r.studentId), c = Service.course(r.courseId);
+              return [r.id, s ? s.studentId : '', c ? c.code : '', r.session, r.semester, r.score,
+                r.grade, r.gradePoint, r.creditUnit, r.attendance];
+            })));
+        UI.toast('Export ready', 'All result records downloaded.', 'good');
+        Service.audit('Data exported', 'results', 'Full result set exported');
+        break;
+      }
+      case 'export-student': {
+        var st = findStudentForAction(id);
+        if (!st) { break; }
+        var rs = Service.resultsFor(st.id);
+        UI.downloadCSV('academiciq-student-' + st.studentId.replace(/\W/g, '-') + '.csv',
+          [['course_code', 'course_title', 'session', 'semester', 'credit_unit', 'score',
+            'grade', 'grade_point', 'attendance']]
+            .concat(rs.map(function (r) {
+              var c = Service.course(r.courseId);
+              return [c ? c.code : '', c ? c.title : '', r.session, r.semester, r.creditUnit,
+                r.score, r.grade, r.gradePoint, r.attendance];
+            })));
+        Service.audit('Data exported', st.studentId, 'Student result history exported');
+        UI.toast('Export ready', 'Student result history downloaded.', 'good');
+        break;
+      }
+      case 'export-results': {
+        var st2 = findStudentForAction(id);
+        if (!st2) { break; }
+        var rs2 = Service.resultsFor(st2.id);
+        UI.downloadCSV('academiciq-my-results.csv',
+          [['course_code', 'session', 'semester', 'credit_unit', 'score', 'grade', 'attendance']]
+            .concat(rs2.map(function (r) {
+              var c = Service.course(r.courseId);
+              return [c ? c.code : '', r.session, r.semester, r.creditUnit, r.score, r.grade, r.attendance];
+            })));
+        UI.toast('Export ready', 'Your results have been downloaded.', 'good');
+        break;
+      }
+      case 'export-course': {
+        var c2 = Service.course(id);
+        if (!c2) { break; }
+        var rsc = Service.resultsForCourse(c2.id);
+        UI.downloadCSV('academiciq-course-' + c2.code + '.csv',
+          [['student_id', 'student_name', 'score', 'grade', 'attendance', 'status']]
+            .concat(rsc.map(function (r) {
+              var s = Service.student(r.studentId);
+              return [s ? s.studentId : '', s ? s.name : '', r.score, r.grade, r.attendance,
+                r.score >= Service.settings().academic.passMark ? 'Passed' : 'Failed'];
+            })));
+        UI.toast('Export ready', 'Course results downloaded.', 'good');
+        break;
+      }
+      case 'record-intervention': {
+        var st3 = findStudentForAction(id);
+        if (!st3) { break; }
+        var rk = Service.risk(st3, Service.resultsFor(st3.id));
+        UI.modal('Record an intervention — ' + st3.name,
+          '<form id="int-form">' +
+            '<div class="grid g-2">' +
+              '<div class="field"><label for="in-risk">Risk level</label><select id="in-risk">' +
+                ['Low', 'Moderate', 'High', 'Critical'].map(function (b) {
+                  return '<option' + (b === rk.band ? ' selected' : '') + '>' + b + '</option>';
+                }).join('') +
+              '</select></div>' +
+              '<div class="field"><label for="in-type">Intervention type</label><select id="in-type">' +
+                ['Academic advising', 'Tutoring', 'Counselling referral', 'Attendance follow-up',
+                 'Course support', 'Study plan', 'Other']
+                  .map(function (t) { return '<option>' + t + '</option>'; }).join('') +
+              '</select></div>' +
+              '<div class="field"><label for="in-adviser">Adviser</label><input id="in-adviser" type="text" value="' +
+                esc(user.name) + '"></div>' +
+              '<div class="field"><label for="in-date">Date</label><input id="in-date" type="date" value="' +
+                new Date().toISOString().slice(0, 10) + '"></div>' +
+            '</div>' +
+            '<div class="field"><label for="in-issue">Issue</label><input id="in-issue" type="text" value="' +
+              esc(rk.factors[0]) + '"></div>' +
+            '<div class="field"><label for="in-action">Action taken</label><textarea id="in-action" style="min-height:70px"></textarea></div>' +
+            '<div class="field"><label for="in-outcome">Outcome</label><textarea id="in-outcome" style="min-height:70px"></textarea></div>' +
+            '<div class="grid g-2">' +
+              '<div class="field"><label for="in-follow">Follow-up date</label><input id="in-follow" type="date"></div>' +
+              '<div class="field"><label for="in-status">Status</label><select id="in-status">' +
+                ['Open', 'In Progress', 'Completed', 'Follow-up Required'].map(function (x) {
+                  return '<option>' + x + '</option>';
+                }).join('') +
+              '</select></div>' +
+            '</div>' +
+            '<div class="modal-actions"><button type="button" class="btn" data-modal-cancel="1">Cancel</button>' +
+            '<button type="submit" class="btn btn-primary">Save intervention</button></div>' +
+          '</form>',
+          function (scope) {
+            var cbtn = $('[data-modal-cancel]', scope);
+            if (cbtn) { cbtn.addEventListener('click', UI.closeModal); }
+            var form = $('#int-form', scope);
+            form.addEventListener('submit', function (ev) {
+              ev.preventDefault();
+              var list = Service.interventions();
+              list.unshift({
+                id: uid('INT'), studentId: st3.id, riskLevel: $('#in-risk', scope).value,
+                issue: $('#in-issue', scope).value, type: $('#in-type', scope).value,
+                adviser: $('#in-adviser', scope).value, date: $('#in-date', scope).value,
+                action: $('#in-action', scope).value, outcome: $('#in-outcome', scope).value,
+                followUp: $('#in-follow', scope).value, status: $('#in-status', scope).value,
+                createdAt: new Date().toISOString()
+              });
+              Service.saveInterventions(list);
+              Service.audit('Intervention recorded', st3.studentId,
+                $('#in-type', scope).value + ' — ' + $('#in-status', scope).value);
+              Service.createNotification('At-risk student alert', 'Intervention recorded',
+                'An intervention was recorded for ' + st3.name + '.', '#/student/' + st3.id);
+              UI.closeModal();
+              UI.toast('Intervention saved',
+                'The record appears in the student profile and the intervention log.', 'good');
+              render();
+            });
+          });
+        break;
+      }
+      case 'validate-import': {
+        var text = $('#csv-text') ? $('#csv-text').value : '';
+        if (!text.trim()) { UI.toast('Import', 'Paste CSV content or choose a file first.', 'bad'); break; }
+        State.importValidation = Service.validateImport(text);
+        UI.toast('Validation complete',
+          State.importValidation.ok
+            ? (State.importValidation.accepted.length + ' accepted, ' + State.importValidation.rejected.length + ' rejected.')
+            : State.importValidation.error,
+          State.importValidation.ok && State.importValidation.rejected.length ? 'warn' : 'good');
+        render();
+        break;
+      }
+      case 'commit-import': {
+        if (!State.importValidation || !State.importValidation.accepted.length) { break; }
+        var summary = Service.commitImport(State.importValidation);
+        State.importValidation = null;
+        UI.toast('Import complete',
+          summary.stored + ' records stored · ' + summary.createdStudents + ' students created · ' +
+          summary.createdCourses + ' courses created · ' + summary.rejected + ' rejected.', 'good');
+        render();
+        break;
+      }
+      case 'reset-import':
+        State.importValidation = null;
+        if ($('#csv-text')) { $('#csv-text').value = ''; }
+        render();
+        break;
+      case 'load-sample':
+        if ($('#csv-text')) { $('#csv-text').value = Service.sampleCSV(); }
+        UI.toast('Sample loaded', 'Review the rows, then select Validate records.', 'good');
+        break;
+      case 'download-template': {
+        var cols = Service.requiredColumns;
+        UI.downloadCSV('academiciq-import-template.csv', [cols, Service.sampleCSV().split('\n')[1].split(',')]);
+        UI.toast('Template ready', 'Header row and one example row downloaded.', 'good');
+        break;
+      }
+      case 'read-notification': {
+        Service.saveNotifications(Service.notifications().map(function (n) {
+          return n.id === id ? Object.assign({}, n, { read: true }) : n;
+        }));
+        render();
+        break;
+      }
+      case 'read-all-notifications':
+        Service.saveNotifications(Service.notifications().map(function (n) {
+          var o = {};
+          Object.keys(n).forEach(function (k) { o[k] = n[k]; });
+          o.read = true;
+          return o;
+        }));
+        UI.toast('Notifications', 'All notifications marked as read.', 'good');
+        render();
+        break;
+      case 'delete-notification':
+        Service.saveNotifications(Service.notifications().filter(function (n) { return n.id !== id; }));
+        render();
+        break;
+      case 'regenerate-alerts': {
+        var alerts = Service.generateAlerts();
+        Store.set('sc_alerts', alerts);
+        Service.audit('Alerts recalculated', 'sc_alerts',
+          alerts.length + ' alert(s) derived from the current dataset');
+        UI.toast('Alerts recalculated', alerts.length + ' alert(s) derived from the dataset.', 'good');
+        render();
+        break;
+      }
+      case 'read-alert':
+        Store.set('sc_alerts', Service.alerts().map(function (a) {
+          var o = {};
+          Object.keys(a).forEach(function (k) { o[k] = a[k]; });
+          if (a.id === id) { o.read = true; }
+          return o;
+        }));
+        render();
+        break;
+      case 'read-all-alerts':
+        Store.set('sc_alerts', Service.alerts().map(function (a) {
+          var o = {};
+          Object.keys(a).forEach(function (k) { o[k] = a[k]; });
+          o.read = true;
+          return o;
+        }));
+        UI.toast('Alerts', 'All alerts marked as read.', 'good');
+        render();
+        break;
+      case 'generate-report':
+        State.reportGenerated = buildReport(State.reportType, user);
+        Service.audit('Report generated', State.reportType, State.reportGenerated.rows.length + ' row(s)');
+        UI.toast('Report generated', State.reportType + ' built from the stored records.', 'good');
+        render();
+        break;
+      case 'print-report':
+        if (!State.reportGenerated) { UI.toast('Print', 'Generate a report first.', 'bad'); break; }
+        window.print();
+        break;
+      case 'export-report': {
+        if (!State.reportGenerated) { UI.toast('Export', 'Generate a report first.', 'bad'); break; }
+        var rep = State.reportGenerated;
+        UI.downloadCSV('academiciq-report.csv',
+          [rep.columns].concat(rep.rows.map(function (r) {
+            return r.map(function (c) { return String(c); });
+          })));
+        Service.audit('Data exported', 'report', rep.title + ' exported');
+        UI.toast('Export ready', 'Report downloaded as CSV.', 'good');
+        break;
+      }
+      case 'save-settings': {
+        var s2 = Service.settings();
+        s2.institution.name = $('#set-name').value;
+        s2.institution.logoText = $('#set-logo').value;
+        s2.institution.address = $('#set-address').value;
+        s2.institution.contact = $('#set-contact').value;
+        s2.academic.passMark = clamp(Number($('#set-pass').value) || 40, 0, 100);
+        s2.academic.attendanceThreshold = clamp(Number($('#set-att').value) || 70, 0, 100);
+        s2.academic.requiredCredits = Math.max(1, Number($('#set-credits').value) || 120);
+        s2.risk.gpaThreshold = clamp(Number($('#set-gpa').value) || 2.5, 0, 5);
+        s2.risk.attendanceThreshold = clamp(Number($('#set-ratt').value) || 70, 0, 100);
+        s2.risk.failureThreshold = Math.max(1, Number($('#set-fail').value) || 2);
+        s2.risk.decliningThreshold = Math.max(0, Number($('#set-dec').value) || 0.3);
+        Service.saveSettings(s2);
+        UI.toast('Settings saved', 'Thresholds and institutional details updated. All metrics recomputed.', 'good');
+        render();
+        break;
+      }
+      case 'reload-settings': render(); break;
+      case 'set-theme': break;
+      case 'save-profile':
+        Auth.updateProfile({ name: $('#pf-name').value, phone: $('#pf-phone').value });
+        Service.audit('Profile updated', user.email, 'Profile details changed');
+        UI.toast('Profile saved', 'Your account details have been updated.', 'good');
+        render();
+        break;
+      case 'change-password': {
+        var oldPw = $('#pw-old').value, newPw = $('#pw-new').value, cf = $('#pw-conf').value;
+        if (oldPw !== user.password) { UI.toast('Password', 'The current password is incorrect.', 'bad'); break; }
+        if (newPw.length < 8) { UI.toast('Password', 'The new password must be at least 8 characters.', 'bad'); break; }
+        if (newPw !== cf) { UI.toast('Password', 'The new passwords do not match.', 'bad'); break; }
+        Service.saveUsers(Service.users().map(function (u) {
+          if (u.id !== user.id) { return u; }
+          var o = {};
+          Object.keys(u).forEach(function (k) { o[k] = u[k]; });
+          o.password = newPw;
+          return o;
+        }));
+        Service.audit('Password changed', user.email, 'User changed their own password');
+        UI.toast('Password changed', 'Use the new password next time you sign in.', 'good');
+        break;
+      }
+      case 'edit-user': {
+        var target = byId(Service.users(), id);
+        if (!target) { break; }
+        UI.modal('Change role — ' + target.name,
+          '<div class="field"><label for="eu-role">Role</label><select id="eu-role">' +
+            ALL_ROLES.map(function (r) {
+              return '<option value="' + r + '"' + (r === target.role ? ' selected' : '') + '>' +
+                esc(ROLE_LABEL[r]) + '</option>';
+            }).join('') +
+          '</select></div>' +
+          '<div class="modal-actions"><button class="btn" data-modal-cancel="1">Cancel</button>' +
+          '<button class="btn btn-primary" data-modal-save="1">Save role</button></div>',
+          function (scope) {
+            var c = $('[data-modal-cancel]', scope), sv = $('[data-modal-save]', scope);
+            if (c) { c.addEventListener('click', UI.closeModal); }
+            sv.addEventListener('click', function () {
+              var newRole = $('#eu-role', scope).value;
+              Service.saveUsers(Service.users().map(function (u) {
+                if (u.id !== id) { return u; }
+                var o = {};
+                Object.keys(u).forEach(function (k) { o[k] = u[k]; });
+                o.role = newRole;
+                return o;
+              }));
+              Service.audit('User role changed', target.email, target.role + ' → ' + newRole);
+              UI.closeModal();
+              UI.toast('Role updated', target.name + ' is now ' + ROLE_LABEL[newRole] + '.', 'good');
+              render();
+            });
+          });
+        break;
+      }
+      case 'toggle-user': {
+        var tu = byId(Service.users(), id);
+        if (!tu) { break; }
+        var next = tu.status === 'active' ? 'suspended' : 'active';
+        Service.saveUsers(Service.users().map(function (u) {
+          if (u.id !== id) { return u; }
+          var o = {};
+          Object.keys(u).forEach(function (k) { o[k] = u[k]; });
+          o.status = next;
+          return o;
+        }));
+        Service.audit(next === 'active' ? 'User activated' : 'User suspended', tu.email, 'Status set to ' + next);
+        UI.toast('Account updated', tu.name + ' is now ' + next + '.', 'good');
+        render();
+        break;
+      }
+      case 'add-faculty':
+        UI.modal('Add faculty',
+          '<div class="field"><label for="af-name">Faculty name</label><input id="af-name" type="text"></div>' +
+          '<div class="modal-actions"><button class="btn" data-modal-cancel="1">Cancel</button>' +
+          '<button class="btn btn-primary" data-modal-save="1">Add</button></div>',
+          function (scope) {
+            $('[data-modal-cancel]', scope).addEventListener('click', UI.closeModal);
+            $('[data-modal-save]', scope).addEventListener('click', function () {
+              var name = $('#af-name', scope).value.trim();
+              if (!name) { UI.toast('Academic structure', 'A faculty name is required.', 'bad'); return; }
+              var list = Service.faculties();
+              list.push({ id: uid('FAC'), name: name });
+              Service.saveFaculties(list);
+              Service.audit('Settings changed', 'faculties', 'Faculty added: ' + name);
+              UI.closeModal();
+              UI.toast('Faculty added', name + ' has been created.', 'good');
+              render();
+            });
+          });
+        break;
+      case 'delete-faculty': {
+        var f = byId(Service.faculties(), id);
+        if (!f) { break; }
+        UI.confirm('Delete faculty',
+          'Delete ' + f.name + '? Existing student and course records are not modified by this action.', function () {
+            Service.saveFaculties(Service.faculties().filter(function (x) { return x.id !== id; }));
+            Service.audit('Settings changed', 'faculties', 'Faculty deleted: ' + f.name);
+            UI.toast('Faculty deleted', f.name + ' removed from the structure.', 'good');
+            render();
+          });
+        break;
+      }
+      case 'add-department':
+        UI.modal('Add department',
+          '<div class="field"><label for="ad-name">Department name</label><input id="ad-name" type="text"></div>' +
+          '<div class="field"><label for="ad-fac">Faculty</label><select id="ad-fac">' +
+            Service.faculties().map(function (x) { return '<option>' + esc(x.name) + '</option>'; }).join('') +
+          '</select></div>' +
+          '<div class="modal-actions"><button class="btn" data-modal-cancel="1">Cancel</button>' +
+          '<button class="btn btn-primary" data-modal-save="1">Add</button></div>',
+          function (scope) {
+            $('[data-modal-cancel]', scope).addEventListener('click', UI.closeModal);
+            $('[data-modal-save]', scope).addEventListener('click', function () {
+              var name = $('#ad-name', scope).value.trim();
+              if (!name) { UI.toast('Academic structure', 'A department name is required.', 'bad'); return; }
+              var list = Service.departments();
+              list.push({ id: uid('DEP'), name: name, faculty: $('#ad-fac', scope).value, programmes: [] });
+              Service.saveDepartments(list);
+              Service.audit('Settings changed', 'departments', 'Department added: ' + name);
+              UI.closeModal();
+              UI.toast('Department added', name + ' has been created.', 'good');
+              render();
+            });
+          });
+        break;
+      case 'add-course':
+        UI.modal('Add course',
+          '<div class="grid g-2">' +
+            '<div class="field"><label for="ac-code">Course code</label><input id="ac-code" type="text" placeholder="CSC401"></div>' +
+            '<div class="field"><label for="ac-units">Credit units</label><input id="ac-units" type="number" min="1" value="3"></div>' +
+          '</div>' +
+          '<div class="field"><label for="ac-title">Course title</label><input id="ac-title" type="text"></div>' +
+          '<div class="grid g-2">' +
+            '<div class="field"><label for="ac-dept">Department</label><select id="ac-dept">' +
+              Service.departments().map(function (d) { return '<option>' + esc(d.name) + '</option>'; }).join('') +
+            '</select></div>' +
+            '<div class="field"><label for="ac-level">Level</label><select id="ac-level">' +
+              ['100', '200', '300', '400'].map(function (l) { return '<option>' + l + '</option>'; }).join('') +
+            '</select></div>' +
+          '</div>' +
+          '<div class="modal-actions"><button class="btn" data-modal-cancel="1">Cancel</button>' +
+          '<button class="btn btn-primary" data-modal-save="1">Add</button></div>',
+          function (scope) {
+            $('[data-modal-cancel]', scope).addEventListener('click', UI.closeModal);
+            $('[data-modal-save]', scope).addEventListener('click', function () {
+              var code = $('#ac-code', scope).value.trim().toUpperCase();
+              var title = $('#ac-title', scope).value.trim();
+              if (!code || !title) {
+                UI.toast('Academic structure', 'Course code and title are required.', 'bad');
+                return;
+              }
+              var list = Service.courses();
+              list.push({
+                id: uid('CRS'), code: code, title: title, department: $('#ac-dept', scope).value,
+                creditUnit: Math.max(1, Number($('#ac-units', scope).value) || 3),
+                level: Number($('#ac-level', scope).value), lecturerId: ''
+              });
+              Service.saveCourses(list);
+              Service.audit('Settings changed', 'courses', 'Course added: ' + code);
+              UI.closeModal();
+              UI.toast('Course added', code + ' has been created.', 'good');
+              render();
+            });
+          });
+        break;
+      case 'delete-course': {
+        var c3 = byId(Service.courses(), id);
+        if (!c3) { break; }
+        UI.confirm('Delete course',
+          'Delete ' + c3.code + '? Result records referencing this course are not modified.', function () {
+            Service.saveCourses(Service.courses().filter(function (x) { return x.id !== id; }));
+            Service.audit('Settings changed', 'courses', 'Course deleted: ' + c3.code);
+            UI.toast('Course deleted', c3.code + ' removed.', 'good');
+            render();
+          });
+        break;
+      }
+      case 'add-semester':
+        UI.modal('Add academic period',
+          '<div class="grid g-2">' +
+            '<div class="field"><label for="as-session">Session (YYYY/YYYY)</label><input id="as-session" type="text" placeholder="2026/2027"></div>' +
+            '<div class="field"><label for="as-sem">Semester</label><select id="as-sem"><option>First</option><option>Second</option></select></div>' +
+            '<div class="field"><label for="as-start">Start date</label><input id="as-start" type="date"></div>' +
+            '<div class="field"><label for="as-end">End date</label><input id="as-end" type="date"></div>' +
+          '</div>' +
+          '<div class="field"><label for="as-status">Status</label><select id="as-status"><option>Active</option><option>Completed</option></select></div>' +
+          '<div class="modal-actions"><button class="btn" data-modal-cancel="1">Cancel</button>' +
+          '<button class="btn btn-primary" data-modal-save="1">Add</button></div>',
+          function (scope) {
+            $('[data-modal-cancel]', scope).addEventListener('click', UI.closeModal);
+            $('[data-modal-save]', scope).addEventListener('click', function () {
+              var session = $('#as-session', scope).value.trim();
+              if (!/^\d{4}\/\d{4}$/.test(session)) {
+                UI.toast('Semesters', 'The session must be in YYYY/YYYY form.', 'bad');
+                return;
+              }
+              var list = Service.semesters();
+              list.push({
+                id: uid('SEM'), session: session, semester: $('#as-sem', scope).value,
+                startDate: $('#as-start', scope).value, endDate: $('#as-end', scope).value,
+                status: $('#as-status', scope).value
+              });
+              Service.saveSemesters(list);
+              Service.audit('Settings changed', 'semesters',
+                'Period added: ' + session + ' ' + $('#as-sem', scope).value);
+              UI.closeModal();
+              UI.toast('Period added', session + ' created.', 'good');
+              render();
+            });
+          });
+        break;
+      case 'delete-semester': {
+        var sm = byId(Service.semesters(), id);
+        if (!sm) { break; }
+        UI.confirm('Delete period', 'Delete ' + sm.session + ' ' + sm.semester + '?', function () {
+          Service.saveSemesters(Service.semesters().filter(function (x) { return x.id !== id; }));
+          UI.toast('Period deleted', sm.session + ' removed.', 'good');
+          render();
+        });
+        break;
+      }
+      case 'reset-data':
+        UI.confirm('Reset demonstration dataset',
+          'This removes every sc_ key from storage and regenerates the deterministic demonstration dataset. Any imported records will be lost.',
+          function () {
+            Store.reset();
+            seedDatabase();
+            Store.set('sc_alerts', Service.generateAlerts());
+            State.filters = {
+              session: '', semester: '', faculty: '', department: '', programme: '',
+              level: '', gender: '', status: '', risk: '', minCgpa: '', maxCgpa: ''
+            };
+            State.reportGenerated = null;
+            State.importValidation = null;
+            UI.toast('Dataset reset', 'The demonstration dataset has been regenerated.', 'good');
+            location.hash = '#/login';
+            render();
+          });
+        break;
+      default: break;
+    }
+  });
+
+  document.addEventListener('change', function (e) {
+    var el = e.target.closest ? e.target.closest('[data-act]') : null;
+    if (!el) { return; }
+    var act = el.getAttribute('data-act');
+    if (act === 'report-type') { State.reportType = el.value; State.reportGenerated = null; render(); }
+    if (act === 'set-theme') {
+      State.theme = el.value;
+      document.documentElement.setAttribute('data-theme', State.theme);
+      Store.set('sc_theme', State.theme);
+      render();
+    }
+    if (act === 'set-email') {
+      var s = Service.settings();
+      s.notifications.email = el.value === 'true';
+      Service.saveSettings(s);
+      UI.toast('Preferences', 'Email notification preference updated.', 'good');
+    }
+  });
+
+  document.addEventListener('input', function (e) {
+    var el = e.target.closest ? e.target.closest('[data-act="student-search"]') : null;
+    if (!el) { return; }
+    State.query = el.value;
+    State.page = 1;
+    var pos = el.selectionStart;
+    render();
+    var again = $('[data-act="student-search"]');
+    if (again) {
+      again.focus();
+      try { again.setSelectionRange(pos, pos); } catch (err) { /* ignore */ }
+    }
+  });
+
+  /* ---- CSV file handling (FileReader) -------------------------------- */
+  document.addEventListener('click', function (e) {
+    var dz = e.target.closest ? e.target.closest('#drop-zone') : null;
+    if (dz) { var fi = $('#csv-file'); if (fi) { fi.click(); } }
+  });
+  document.addEventListener('change', function (e) {
+    if (e.target && e.target.id === 'csv-file' && e.target.files && e.target.files[0]) {
+      var file = e.target.files[0];
+      var reader = new FileReader();
+      reader.onload = function (ev) {
+        var ta = $('#csv-text');
+        if (ta) { ta.value = String(ev.target.result); }
+        State.importValidation = Service.validateImport(String(ev.target.result));
+        UI.toast('File read', 'Validation complete — review the summary below.', 'good');
+        render();
+      };
+      reader.onerror = function () { UI.toast('File error', 'The file could not be read.', 'bad'); };
+      reader.readAsText(file);
+    }
+  });
+  ['dragover', 'dragenter'].forEach(function (evt) {
+    document.addEventListener(evt, function (e) {
+      var dz = e.target.closest ? e.target.closest('#drop-zone') : null;
+      if (dz) { e.preventDefault(); dz.classList.add('over'); }
+    });
+  });
+  ['dragleave', 'drop'].forEach(function (evt) {
+    document.addEventListener(evt, function (e) {
+      var dz = e.target.closest ? e.target.closest('#drop-zone') : null;
+      if (dz) { e.preventDefault(); dz.classList.remove('over'); }
+    });
+  });
+  document.addEventListener('drop', function (e) {
+    var dz = e.target.closest ? e.target.closest('#drop-zone') : null;
+    if (!dz) { return; }
+    e.preventDefault();
+    if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0]) {
+      var file = e.dataTransfer.files[0];
+      var reader = new FileReader();
+      reader.onload = function (ev) {
+        var ta = $('#csv-text');
+        if (ta) { ta.value = String(ev.target.result); }
+        State.importValidation = Service.validateImport(String(ev.target.result));
+        UI.toast('File read', 'Validation complete — review the summary below.', 'good');
+        render();
+      };
+      reader.readAsText(file);
+    }
+  });
+
+  window.addEventListener('hashchange', render);
+  window.addEventListener('keydown', function (e) { if (e.key === 'Escape') { UI.closeModal(); } });
+
+  /* ======================================================================
+     14. BOOTSTRAP
+     ====================================================================== */
+  function init() {
+    /* theme before first paint */
+    var saved = Store.get('sc_theme', null);
+    if (saved) { State.theme = saved; }
+    else if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) { State.theme = 'dark'; }
+    document.documentElement.setAttribute('data-theme', State.theme);
+
+    /* seed once */
+    if (!Store.get('sc_seeded', false) || !Service.students().length) { seedDatabase(); }
+
+    /* derive alerts at start-up if none are stored */
+    if (!Service.alerts().length) { Store.set('sc_alerts', Service.generateAlerts()); }
+
+    if (!Store.isAvailable()) {
+      UI.toast('Storage unavailable',
+        'Private browsing may be restricting LocalStorage. The session continues with an in-memory store.', 'warn');
+    }
+
+    if (!location.hash) { location.hash = Auth.current() ? '#/dashboard' : '#/home'; }
+    render();
+  }
+
+  init();
+})();
